@@ -1,68 +1,63 @@
 # cockatiel_module-state-rs
 
-A per-user **typed key/value state** store for Cockatiel — JSON-like properties
-attached to a chat user, with optional **constraints**.
+Per-**character** stats for Cockatiel — each stat has a **category**, a **name**,
+and a typed **value**, with optional **constraints** and **formula-driven
+per-turn modifiers**.
 
-## Commands
+A stat belongs to a character (an RP character name, e.g. `alice`). **Anyone may
+read or edit any character's stats.**
+
+## Commands (explicit flags; `-char` names the target character)
 
 | Command | Effect |
 |---|---|
-| `!state set <key>=<value>` | set a property on **you** |
-| `!state set @user <key>=<value>` | set a property on **someone else** (anyone may) |
-| `!state get [@user] <key>` | read a property |
-| `!state list [@user]` | list keys (and values) |
-| `!state remove [@user] <key>` | delete a property |
-| `!state define <key> [type=…] [min=…] [max=…] [options=a\|b\|c]` | constrain a key |
-| `!state modifier <name> <key> <delta> [x<turns>]` | add a named per-turn modifier |
-| `!state modifier remove <name>` | remove a modifier by name |
-| `!state modifier list` | list modifiers |
+| `!state stat -char <c> [-c <category>] -n <name> -v <value>` | create/update a stat |
+| `!state modify -char <c> -k <name> -v <value>` | set a stat's value |
+| `!state modify -char <c> -k <name> -m <formula> [-t <turns>] [-name <mname>]` | add/replace a modifier |
+| `!state list -char <c> [-c <category>]` | list stats (grouped by category) |
+| `!state remove -char <c> -k <name>` | remove one stat |
+| `!state remove -char <c> -c <category>` | remove a whole category |
+| `!state modifiers -char <c>` | list active modifiers |
+| `!state define -k <name> [-type …] [-min …] [-max …] [-options a\|b\|c]` | constrain a key |
 | `!state help` | usage |
 
-### Modifiers (status effects)
-
-A modifier adjusts a stat by `delta` **every turn** (a turn = one ordinary
-message from the affected user; `!state` commands don't count). It lasts
-`x<turns>` turns, or **indefinitely** — omit the turns, or use `inf`, a negative
-number, or `0`. A modifier has a **name** so it can be removed/replaced easily.
-
-```
-!state modifier health +5 x7        # +5 health each turn, for 7 turns
-!state modifier regen health +5 x7  # named "regen" (long form)
-!state modifier poison health -3    # indefinite -3
-!state modifier speed +0.5 x3
-!state modifier @user health +5 x2  # apply to someone else
-!state modifier remove regen
-!state modifier list
-```
-
-Values are clamped to the key's constraint (so `health` with `min=0 max=20`
-never leaves `[0, 20]`).
+`-c` (stat) is the **category**; `-k` (modify/remove/define) is the stat **key**;
+`-m` is the **formula**; `-t` is the turn budget.
 
 ## Values & constraints
 
-Values are typed: **int**, **float**, **string**, **bool**, or **options** (a
-string restricted to a set). Without a constraint the type is inferred from the
-text (`42` → int, `4.2` → float, `true`/`false` → bool, otherwise string).
+Values are typed: **int / float / string / bool / options** (a string restricted
+to a set). Without a constraint the type is inferred from the text (`42` → int,
+`4.2` → float, `true` → bool, else string).
 
-A key's constraint has three **optional** parts:
+A constraint has three **optional** parts — `type`, `min`/`max`, `options` — from
+two sources, merged (**operator wins**):
 
-- `type` — `int` | `float` | `string` | `bool` | `options`
-- `min` / `max` — numeric bounds (for int/float)
-- `options` — an array of allowed strings (for `type=options`)
+1. the **operator schema** in `config.json` → `module_specific.schema`
+   (`{"hp": {"type":"int","min":0,"max":100}}`), and
+2. **`!state define`** (stored per server).
 
-Constraints come from **two** places, merged (operator wins):
+## Modifiers (formula status effects)
 
-1. The **operator schema** in `config.json` → `module_specific.schema`
-   (`{"score": {"type":"int","min":0,"max":100}}`).
-2. **User-defined** constraints via `!state define` (stored per server).
+A modifier changes its stat by a **formula** every **turn** (a turn = one
+ordinary message; `!state` commands don't count). In the formula, `t` is the
+modifier's turn number and **any stat name** is a variable (its current value):
 
-A value that violates a constraint is rejected with a clear message.
+```
+!state modify -char alice -k hp -m t*2              # +2, +4, +6 … each turn
+!state modify -char alice -k hp -m "hp/10 + 1"      # references another stat
+!state modify -char alice -k hp -m 5 -t 7 -name regen   # +5/turn, 7 turns
+```
+
+The turn budget `-t <n>` defaults to (and is forced to) **indefinite** when
+omitted, `inf`, or non-positive. `-name` names the modifier (defaults to the
+key); re-adding a name replaces it. The result is clamped to the key's
+constraint, and a non-numeric stat is skipped.
 
 ## Storage
 
 One `turso` (SQLite) database per **server** (`<db_dir>/<guild_id>.db`) holding
-the `state` (subject, key, value) and `constraints` tables. Subjects are keyed by
-platform identity (the stable platform user id). UUID7 keys; DB files gitignored.
+the `stats`, `constraints`, and `modifiers` tables. DB files gitignored.
 
 ## Config (`module_specific`)
 

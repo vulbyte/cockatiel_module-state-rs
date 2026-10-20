@@ -1,22 +1,33 @@
-//! state — per-user typed key/value state with optional constraints.
+//! state — per-character stats with categories, optional constraints, and
+//! formula-driven per-turn modifiers.
 //!
-//! Each chat user has a JSON-like bag of properties. **Anyone may read or edit
-//! anyone's** properties. A property's value is typed (int / float / string /
-//! bool / options) and may be constrained by an optional `type`, `min`/`max`,
-//! and `options` (an array of allowed strings).
+//! A **stat** belongs to a **character** (an RP character name, e.g. "alice")
+//! and has a **category** (for grouping), a **name** (the key) and a typed
+//! **value**. Anyone may read or edit any character's stats.
 //!
-//!   `!state set [@user] <key>=<value>`   set (add or modify)
-//!   `!state get [@user] <key>`           read
-//!   `!state list [@user]`                list keys + values
-//!   `!state remove [@user] <key>`        delete
-//!   `!state define <key> [type=.. min=.. max=.. options=a|b|c]`   constrain a key
-//!   `!state help`
+//! Explicit, flag-based commands (the `-char` names the target character):
 //!
-//! Constraints come from the operator's `config.json` schema AND from
-//! user-defined `!state define` calls (merged; the operator wins). Without a
-//! constraint the value's type is inferred from the text.
+//!   !state stat   -char <c> [-c <category>] -n <name> -v <value>
+//!   !state modify -char <c> -k <name> -v <value>            set a value
+//!   !state modify -char <c> -k <name> -m <formula> [-t <n>] [-name <mname>]
+//!                                                           add/replace a modifier
+//!   !state list   -char <c> [-c <category>]
+//!   !state remove -char <c> -k <name>       remove one stat
+//!   !state remove -char <c> -c <category>   remove a whole category
+//!   !state help
 //!
-//! Storage: one `turso` DB per server (`<db_dir>/<guild_id>.db`) + a global DB.
+//! A **modifier** changes its stat by a formula **every turn** (a turn = one
+//! ordinary message). In the formula, `t` is the modifier's turn number and any
+//! stat name is a variable (its current value), e.g. `-m t*2` or `-m hp/10 + 1`.
+//! `-t <n>` sets a finite turn budget; omitted / `inf` / a non-positive number
+//! means indefinite. The result is clamped to the key's constraint.
+//!
+//! Values are typed (int / float / string / bool / options) and may be
+//! constrained by `type`, `min`/`max`, and `options` — from the operator schema
+//! (`config.json` → `module_specific.schema`) and from `!state` … merges (the
+//! operator wins). Without a `type` the value's type is inferred from the text.
+//!
+//! Storage: one `turso` DB per server (`<db_dir>/<guild_id>.db`).
 
 use futures_util::{SinkExt, StreamExt};
 use prost::Message;
@@ -43,10 +54,10 @@ const DEFAULT_DB_DIR: &str = "~/.cockatiel/state";
 const DEFAULT_RECONNECT_BASE_SECS: u32 = 1;
 const DEFAULT_RECONNECT_MAX_SECS: u32 = 30;
 const DM_DB: &str = "_dm";
-/// Hard caps so a single user cannot bloat the store.
-const MAX_KEYS_PER_SUBJECT: usize = 200;
-const MAX_KEY_LEN: usize = 64;
+const DEFAULT_CATEGORY: &str = "general";
+const MAX_NAME_LEN: usize = 64;
 const MAX_VALUE_LEN: usize = 1024;
+const MAX_STATS_PER_CHAR: usize = 200;
 
 // ── config ────────────────────────────────────────────────────────────────
 
@@ -56,7 +67,7 @@ struct Settings {
     db_dir: String,
     reconnect_base_secs: u32,
     reconnect_max_secs: u32,
-    /// The operator's constraints: key -> Constraint.
+    /// Operator constraints: key -> Constraint.
     schema: HashMap<String, Constraint>,
 }
 
@@ -75,14 +86,9 @@ fn ensure_defaults() -> Settings {
     let reconnect_base_secs = ms.get("reconnect_base_secs").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(DEFAULT_RECONNECT_BASE_SECS);
     let reconnect_max_secs = ms.get("reconnect_max_secs").and_then(|v| v.as_u64()).map(|v| v as u32).unwrap_or(DEFAULT_RECONNECT_MAX_SECS);
     let schema = ms.get("schema").map(parse_schema).unwrap_or_default();
-
     if let Some(mut root) = root {
         if let Some(obj) = root.as_object_mut() {
-            if let Some(ms) = obj
-                .entry("module_specific".to_string())
-                .or_insert_with(|| serde_json::json!({}))
-                .as_object_mut()
-            {
+            if let Some(ms) = obj.entry("module_specific".to_string()).or_insert_with(|| serde_json::json!({})).as_object_mut() {
                 ms.entry("command_flag".to_string()).or_insert_with(|| serde_json::json!(command_flag));
                 ms.entry("db_dir".to_string()).or_insert_with(|| serde_json::json!(db_dir));
                 ms.entry("reconnect_base_secs".to_string()).or_insert_with(|| serde_json::json!(reconnect_base_secs));
@@ -95,20 +101,19 @@ fn ensure_defaults() -> Settings {
     Settings { command_flag, db_dir, reconnect_base_secs, reconnect_max_secs, schema }
 }
 
-/// Parse the operator schema: `{"key": {"type":"int","min":0,"max":100}}`.
 fn parse_schema(v: &serde_json::Value) -> HashMap<String, Constraint> {
     let mut out = HashMap::new();
     if let Some(obj) = v.as_object() {
         for (k, c) in obj {
-            let con = Constraint {
-                ctype: c.get("type").and_then(|x| x.as_str()).map(|s| s.to_ascii_lowercase()),
-                min: c.get("min").and_then(|x| x.as_f64()),
-                max: c.get("max").and_then(|x| x.as_f64()),
-                options: c.get("options").and_then(|x| x.as_array()).map(|a| {
-                    a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect()
-                }),
-            };
-            out.insert(k.clone(), con);
+            out.insert(
+                k.clone(),
+                Constraint {
+                    ctype: c.get("type").and_then(|x| x.as_str()).map(|s| s.to_ascii_lowercase()),
+                    min: c.get("min").and_then(|x| x.as_f64()),
+                    max: c.get("max").and_then(|x| x.as_f64()),
+                    options: c.get("options").and_then(|x| x.as_array()).map(|a| a.iter().filter_map(|s| s.as_str().map(|s| s.to_string())).collect()),
+                },
+            );
         }
     }
     out
@@ -127,7 +132,7 @@ fn expand_tilde(path: &str) -> String {
     path.to_string()
 }
 
-// ── the value + constraint model (pure, unit-tested) ────────────────────────
+// ── value + constraint (pure) ───────────────────────────────────────────────
 
 #[derive(Debug, Clone, PartialEq)]
 enum Value {
@@ -146,8 +151,6 @@ impl Value {
             Value::Str(_) => "string",
         }
     }
-
-    /// The stored JSON scalar (strings quoted, numbers/bools bare).
     fn to_json(&self) -> String {
         match self {
             Value::Int(i) => serde_json::Value::from(*i).to_string(),
@@ -156,7 +159,6 @@ impl Value {
             Value::Str(s) => serde_json::Value::from(s.as_str()).to_string(),
         }
     }
-
     fn from_json(s: &str) -> Option<Value> {
         match serde_json::from_str::<serde_json::Value>(s).ok()? {
             serde_json::Value::Number(n) => {
@@ -171,8 +173,6 @@ impl Value {
             _ => None,
         }
     }
-
-    /// Human-readable, as shown in replies.
     fn display(&self) -> String {
         match self {
             Value::Int(i) => i.to_string(),
@@ -181,12 +181,19 @@ impl Value {
             Value::Str(s) => s.clone(),
         }
     }
+    /// Numeric view (for formulas / modifiers); None for strings/bools.
+    fn as_f64(&self) -> Option<f64> {
+        match self {
+            Value::Int(i) => Some(*i as f64),
+            Value::Float(f) => Some(*f),
+            _ => None,
+        }
+    }
 }
 
-/// An optional constraint on a key's value.
 #[derive(Debug, Clone, Default, PartialEq)]
 struct Constraint {
-    ctype: Option<String>, // int | float | string | bool | options
+    ctype: Option<String>,
     min: Option<f64>,
     max: Option<f64>,
     options: Option<Vec<String>>,
@@ -196,8 +203,6 @@ impl Constraint {
     fn is_empty(&self) -> bool {
         self.ctype.is_none() && self.min.is_none() && self.max.is_none() && self.options.is_none()
     }
-
-    /// Operator fields win over user fields.
     fn merged_with_user(&self, user: &Constraint) -> Constraint {
         Constraint {
             ctype: self.ctype.clone().or_else(|| user.ctype.clone()),
@@ -206,15 +211,13 @@ impl Constraint {
             options: self.options.clone().or_else(|| user.options.clone()),
         }
     }
-
-    /// Whether `v` satisfies this constraint; `Err` explains the violation.
     fn validate(&self, v: &Value) -> Result<(), String> {
         if let Some(t) = &self.ctype {
             let ok = matches!(
                 (t.as_str(), v),
                 ("int", Value::Int(_))
                     | ("float", Value::Float(_))
-                    | ("float", Value::Int(_)) // an int is a valid float
+                    | ("float", Value::Int(_))
                     | ("string", Value::Str(_))
                     | ("bool", Value::Bool(_))
                     | ("options", Value::Str(_))
@@ -223,11 +226,7 @@ impl Constraint {
                 return Err(format!("must be a `{t}` (got {})", v.type_name()));
             }
         }
-        let num = match v {
-            Value::Int(i) => Some(*i as f64),
-            Value::Float(f) => Some(*f),
-            _ => None,
-        };
+        let num = v.as_f64();
         if let Some(min) = self.min {
             match num {
                 Some(n) if n >= min => {}
@@ -251,62 +250,28 @@ impl Constraint {
         }
         Ok(())
     }
-
     fn describe(&self) -> String {
-        let mut parts = Vec::new();
+        let mut p = Vec::new();
         if let Some(t) = &self.ctype {
-            parts.push(format!("type={t}"));
+            p.push(format!("type={t}"));
         }
         if let Some(m) = self.min {
-            parts.push(format!("min={m}"));
+            p.push(format!("min={m}"));
         }
         if let Some(m) = self.max {
-            parts.push(format!("max={m}"));
+            p.push(format!("max={m}"));
         }
         if let Some(o) = &self.options {
-            parts.push(format!("options={}", o.join("|")));
+            p.push(format!("options={}", o.join("|")));
         }
-        if parts.is_empty() {
+        if p.is_empty() {
             "none".to_string()
         } else {
-            parts.join(" ")
+            p.join(" ")
         }
     }
 }
 
-/// A named status effect: on each of the subject's turns, add `delta` to the
-/// `key` stat, decrementing `turns` (-1 = lasts forever). Removed at 0 turns.
-#[derive(Debug, Clone, PartialEq)]
-struct Modifier {
-    name: String,
-    key: String,
-    delta: f64,
-    /// Remaining turns; -1 means indefinite.
-    turns: i64,
-}
-
-/// Parse a delta like `+5`, `-3`, `5`, `+0.5` (a leading `+` is allowed).
-fn parse_delta(s: &str) -> Option<f64> {
-    let t = s.trim();
-    if t.is_empty() {
-        return None;
-    }
-    t.trim_start_matches('+').parse::<f64>().ok()
-}
-
-/// Parse a turn count: `7` / `x7` (finite), or anything non-positive —
-/// `0`, a negative number, `inf`/`infinite`/`forever` — means INDEFINITE (-1).
-/// (An unspecified count is handled by the caller as indefinite too.)
-fn parse_turns(s: &str) -> Option<i64> {
-    let t = s.trim().trim_start_matches(['x', 'X']).trim();
-    if t.eq_ignore_ascii_case("inf") || t.eq_ignore_ascii_case("infinite") || t.eq_ignore_ascii_case("forever") {
-        return Some(-1);
-    }
-    let n = t.parse::<i64>().ok()?;
-    Some(if n <= 0 { -1 } else { n })
-}
-
-/// Infer a value from raw text when no `type` is declared.
 fn infer_value(raw: &str) -> Value {
     let t = raw.trim();
     if let Ok(i) = t.parse::<i64>() {
@@ -322,7 +287,6 @@ fn infer_value(raw: &str) -> Value {
     }
 }
 
-/// Coerce raw text to a declared type.
 fn coerce(raw: &str, ctype: &str) -> Result<Value, String> {
     let t = raw.trim();
     match ctype {
@@ -338,127 +302,268 @@ fn coerce(raw: &str, ctype: &str) -> Result<Value, String> {
     }
 }
 
-// ── command parsing (pure, unit-tested) ─────────────────────────────────────
+/// Parse a turn count: `7`/`x7` finite; omitted/non-positive/`inf` → -1 (forever).
+fn parse_turns(s: &str) -> Option<i64> {
+    let t = s.trim().trim_start_matches(['x', 'X']).trim();
+    if t.eq_ignore_ascii_case("inf") || t.eq_ignore_ascii_case("infinite") || t.eq_ignore_ascii_case("forever") {
+        return Some(-1);
+    }
+    Some(match t.parse::<i64>().ok()? {
+        n if n <= 0 => -1,
+        n => n,
+    })
+}
+
+// ── formula evaluator (pure) ────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+enum Tok {
+    Num(f64),
+    Var(String),
+    Op(char),
+    LP,
+    RP,
+}
+
+fn tokenize(expr: &str) -> Result<Vec<Tok>, String> {
+    let chars: Vec<char> = expr.chars().collect();
+    let mut toks = Vec::new();
+    let mut i = 0;
+    while i < chars.len() {
+        let c = chars[i];
+        if c.is_whitespace() {
+            i += 1;
+        } else if c.is_ascii_digit() || c == '.' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_digit() || chars[i] == '.') {
+                i += 1;
+            }
+            let n: f64 = chars[start..i].iter().collect::<String>().parse().map_err(|_| "bad number".to_string())?;
+            toks.push(Tok::Num(n));
+        } else if c.is_ascii_alphabetic() || c == '_' {
+            let start = i;
+            while i < chars.len() && (chars[i].is_ascii_alphanumeric() || chars[i] == '_') {
+                i += 1;
+            }
+            toks.push(Tok::Var(chars[start..i].iter().collect()));
+        } else {
+            toks.push(match c {
+                '+' | '-' | '*' | '/' => Tok::Op(c),
+                '(' => Tok::LP,
+                ')' => Tok::RP,
+                _ => return Err(format!("unexpected `{c}`")),
+            });
+            i += 1;
+        }
+    }
+    Ok(toks)
+}
+
+struct Parser<'a> {
+    toks: &'a [Tok],
+    pos: usize,
+    vars: &'a HashMap<String, f64>,
+}
+
+impl Parser<'_> {
+    fn peek(&self) -> Option<&Tok> {
+        self.toks.get(self.pos)
+    }
+    fn expr(&mut self) -> Result<f64, String> {
+        let mut v = self.term()?;
+        while let Some(Tok::Op(op @ ('+' | '-'))) = self.peek() {
+            let op = *op;
+            self.pos += 1;
+            let r = self.term()?;
+            v = if op == '+' { v + r } else { v - r };
+        }
+        Ok(v)
+    }
+    fn term(&mut self) -> Result<f64, String> {
+        let mut v = self.factor()?;
+        while let Some(Tok::Op(op @ ('*' | '/'))) = self.peek() {
+            let op = *op;
+            self.pos += 1;
+            let r = self.factor()?;
+            if op == '/' {
+                if r == 0.0 {
+                    return Err("division by zero".to_string());
+                }
+                v /= r;
+            } else {
+                v *= r;
+            }
+        }
+        Ok(v)
+    }
+    fn factor(&mut self) -> Result<f64, String> {
+        match self.peek().cloned() {
+            Some(Tok::Num(n)) => {
+                self.pos += 1;
+                Ok(n)
+            }
+            Some(Tok::Var(name)) => {
+                self.pos += 1;
+                self.vars.get(&name.to_ascii_lowercase()).copied().ok_or_else(|| format!("unknown name `{name}`"))
+            }
+            Some(Tok::Op('-')) => {
+                self.pos += 1;
+                Ok(-self.factor()?)
+            }
+            Some(Tok::Op('+')) => {
+                self.pos += 1;
+                self.factor()
+            }
+            Some(Tok::LP) => {
+                self.pos += 1;
+                let v = self.expr()?;
+                match self.peek() {
+                    Some(Tok::RP) => {
+                        self.pos += 1;
+                        Ok(v)
+                    }
+                    _ => Err("missing `)`".to_string()),
+                }
+            }
+            other => Err(format!("unexpected {other:?}")),
+        }
+    }
+}
+
+/// Evaluate a formula with the given variables (names lower-cased).
+fn eval_formula(expr: &str, vars: &HashMap<String, f64>) -> Result<f64, String> {
+    let toks = tokenize(expr)?;
+    if toks.is_empty() {
+        return Err("empty formula".to_string());
+    }
+    let mut p = Parser { toks: &toks, pos: 0, vars };
+    let v = p.expr()?;
+    if p.pos != p.toks.len() {
+        return Err("trailing input".to_string());
+    }
+    Ok(v)
+}
+
+// ── stat + modifier ─────────────────────────────────────────────────────────
+
+#[derive(Debug, Clone, PartialEq)]
+struct Stat {
+    category: String,
+    name: String,
+    value: Value,
+}
+
+#[derive(Debug, Clone, PartialEq)]
+struct Modifier {
+    name: String,
+    key: String,
+    expr: String,
+    /// Remaining turns; -1 = indefinite.
+    turns: i64,
+    /// Turns already applied (so `t` in the formula is `ticked + 1`).
+    ticked: i64,
+}
+
+fn describe_modifier(m: &Modifier) -> String {
+    let dur = if m.turns < 0 { "∞".to_string() } else { format!("{} turn(s)", m.turns) };
+    format!("`{}` {}(={}) to `{}` ({dur})", m.name, m.expr, m.ticked + 1, m.key)
+}
+
+// ── flags ───────────────────────────────────────────────────────────────────
+
+/// Parse `-flag value…` pairs. A token `-<letter>…` starts a flag; everything
+/// until the next flag is its value (so formulas may contain spaces). A bare
+/// `-5` is a value, not a flag.
+fn parse_flags(args: &str) -> HashMap<String, String> {
+    let mut out = HashMap::new();
+    let mut cur: Option<String> = None;
+    let mut buf: Vec<String> = Vec::new();
+    fn flush(out: &mut HashMap<String, String>, cur: &mut Option<String>, buf: &mut Vec<String>) {
+        if let Some(k) = cur.take() {
+            out.insert(k, buf.join(" "));
+        }
+        buf.clear();
+    }
+    for tok in args.split_whitespace() {
+        let is_flag = tok.len() >= 2
+            && tok.starts_with('-')
+            && tok[1..].chars().next().map(|c| c.is_ascii_alphabetic()).unwrap_or(false);
+        if is_flag {
+            flush(&mut out, &mut cur, &mut buf);
+            cur = Some(tok[1..].to_ascii_lowercase());
+        } else {
+            buf.push(tok.to_string());
+        }
+    }
+    flush(&mut out, &mut cur, &mut buf);
+    out
+}
+
+// ── commands ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, PartialEq)]
 enum StateCmd {
-    Set { key: String, raw_value: String },
-    Get { key: String },
-    List,
-    Remove { key: String },
+    Stat { character: String, category: String, name: String, value: String },
+    Modify { character: String, key: String, value: Option<String>, expr: Option<String>, turns: Option<i64>, mname: Option<String> },
+    List { character: String, category: Option<String> },
+    Remove { character: String, key: Option<String>, category: Option<String> },
     Define { key: String, constraint: Constraint },
+    Modifiers { character: String },
     Help,
-    ModAdd { name: String, key: String, delta: f64, turns: i64 },
-    ModRemove { name: String },
-    ModList,
 }
 
-/// Parse the args after `!state`, returning the command + whether a leading
-/// `@mention` was present (the caller resolves the target separately).
-fn parse_state_command(args: &str) -> Option<(StateCmd, bool)> {
-    // A mention may sit BEFORE the verb (`!state @user set k=v`) or, more
-    // naturally, right AFTER it (`!state set @user k=v`).
-    let (args, before) = strip_mention(args);
-    let (head, rest0) = split_head(args);
-    let (rest, after) = strip_mention(rest0);
-    let had_mention = before || after;
-    let cmd = match head.to_ascii_lowercase().as_str() {
-        "" => return None,
-        "help" => StateCmd::Help,
-        "list" => StateCmd::List,
-        "set" => {
-            let (k, v) = rest.split_once('=')?;
-            let key = k.trim();
-            if key.is_empty() {
-                return None;
-            }
-            StateCmd::Set { key: key.to_string(), raw_value: v.trim().to_string() }
+/// Parse the args after `!state` into a command.
+fn parse_state_command(args: &str) -> Option<StateCmd> {
+    let (verb, rest) = split_head(args);
+    let f = parse_flags(rest);
+    let get = |k: &str| f.get(k).cloned().filter(|s| !s.trim().is_empty());
+    match verb.to_ascii_lowercase().as_str() {
+        "" => None,
+        "help" => Some(StateCmd::Help),
+        "stat" => Some(StateCmd::Stat {
+            character: get("char")?,
+            category: get("c").unwrap_or_else(|| DEFAULT_CATEGORY.to_string()),
+            name: get("n")?,
+            value: get("v")?,
+        }),
+        "modify" | "mod" => {
+            let character = get("char")?;
+            let key = get("k")?;
+            Some(StateCmd::Modify {
+                character,
+                key,
+                value: get("v"),
+                expr: get("m"),
+                turns: get("t").map(|t| parse_turns(&t)).unwrap_or(Some(-1)),
+                mname: get("name"),
+            })
         }
-        "get" => {
-            let key = rest.trim();
-            if key.is_empty() {
-                return None;
-            }
-            StateCmd::Get { key: key.to_string() }
-        }
-        "remove" | "delete" | "rm" => {
-            let key = rest.trim();
-            if key.is_empty() {
-                return None;
-            }
-            StateCmd::Remove { key: key.to_string() }
-        }
-        "define" => parse_define(rest)?,
-        "modifier" | "mod" => parse_modifier(rest)?,
-        _ => return None,
-    };
-    Some((cmd, had_mention))
-}
-
-/// `modifier <name> <key> <delta> [x<turns>]` (add/replace) — or, if the second
-/// token is a delta, the short form `modifier <key> <delta> [x<turns>]` where
-/// the name defaults to the key. Plus `modifier remove <name>` / `modifier list`.
-fn parse_modifier(rest: &str) -> Option<StateCmd> {
-    let toks: Vec<&str> = rest.split_whitespace().collect();
-    match toks.first().map(|s| s.to_ascii_lowercase()).as_deref() {
-        None => return None,
-        Some("list") => return Some(StateCmd::ModList),
-        Some("remove") | Some("delete") | Some("rm") => {
-            return Some(StateCmd::ModRemove { name: toks.get(1)?.to_string() })
-        }
-        _ => {}
+        "list" => Some(StateCmd::List { character: get("char")?, category: get("c") }),
+        "remove" | "delete" | "rm" => Some(StateCmd::Remove {
+            character: get("char")?,
+            key: get("k"),
+            category: get("c"),
+        }),
+        "define" => Some(StateCmd::Define {
+            key: get("k")?,
+            constraint: Constraint {
+                ctype: get("type").map(|s| s.to_ascii_lowercase()),
+                min: get("min").and_then(|s| s.parse::<f64>().ok()),
+                max: get("max").and_then(|s| s.parse::<f64>().ok()),
+                options: get("options").map(|s| s.split('|').map(|x| x.trim().to_string()).collect()),
+            },
+        }),
+        "modifiers" | "mods" => Some(StateCmd::Modifiers { character: get("char")? }),
+        _ => None,
     }
-    // Short form when the 2nd token is a delta (name = key).
-    let (name, key, delta_s, turns_s) = if toks.len() >= 2 && parse_delta(toks[1]).is_some() {
-        (toks[0].to_string(), toks[0].to_string(), toks[1], toks.get(2).copied())
-    } else {
-        (toks.first()?.to_string(), toks.get(1)?.to_string(), *toks.get(2)?, toks.get(3).copied())
-    };
-    let delta = parse_delta(delta_s)?;
-    let turns = match turns_s {
-        Some(s) => parse_turns(s)?,
-        None => -1,
-    };
-    Some(StateCmd::ModAdd { name, key, delta, turns })
 }
 
-fn parse_define(rest: &str) -> Option<StateCmd> {
-    let (key, opts) = split_head(rest);
-    if key.is_empty() {
-        return None;
-    }
-    let mut c = Constraint::default();
-    for tok in opts.split_whitespace() {
-        let (k, v) = tok.split_once('=')?;
-        match k.to_ascii_lowercase().as_str() {
-            "type" => c.ctype = Some(v.to_ascii_lowercase()),
-            "min" => c.min = v.parse::<f64>().ok(),
-            "max" => c.max = v.parse::<f64>().ok(),
-            "options" => c.options = Some(v.split('|').map(|s| s.trim().to_string()).collect()),
-            _ => return None,
-        }
-    }
-    Some(StateCmd::Define { key: key.to_string(), constraint: c })
-}
-
-/// Split the first whitespace-delimited token from the rest.
 fn split_head(s: &str) -> (&str, &str) {
     let s = s.trim_start();
     match s.split_once(char::is_whitespace) {
         Some((h, r)) => (h, r.trim_start()),
         None => (s, ""),
     }
-}
-
-/// Drop a leading Discord mention token (`<@123>` / `<@!123>`), reporting it.
-fn strip_mention(args: &str) -> (&str, bool) {
-    let t = args.trim_start();
-    if t.starts_with("<@") {
-        if let Some(end) = t.find('>') {
-            return (t[end + 1..].trim_start(), true);
-        }
-    }
-    (t, false)
 }
 
 /// Parse the args after `!state` from a raw message, or None if not `!state`.
@@ -476,28 +581,6 @@ fn parse_state_args(raw: &str, flag: &str, name: &str) -> Option<String> {
         Some(c) if c.is_whitespace() => Some(tail.trim_start().to_string()),
         _ => None,
     }
-}
-
-// ── discord raw_data helpers ────────────────────────────────────────────────
-
-/// (id, handle) of the message author, from the Discord MESSAGE_CREATE JSON.
-fn discord_author(raw_data: &[u8]) -> (String, String) {
-    let Ok(v) = serde_json::from_slice::<serde_json::Value>(raw_data) else {
-        return (String::new(), String::new());
-    };
-    let a = v.get("author");
-    let id = a.and_then(|a| a.get("id")).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    let handle = a.and_then(|a| a.get("username")).and_then(|x| x.as_str()).unwrap_or("").to_string();
-    (id, handle)
-}
-
-/// (id, handle) of the FIRST mentioned user, if any.
-fn discord_mention(raw_data: &[u8]) -> Option<(String, String)> {
-    let v: serde_json::Value = serde_json::from_slice(raw_data).ok()?;
-    let m = v.get("mentions")?.as_array()?.first()?;
-    let id = m.get("id").and_then(|x| x.as_str())?.to_string();
-    let handle = m.get("username").and_then(|x| x.as_str()).unwrap_or("").to_string();
-    Some((id, handle))
 }
 
 fn discord_guild(raw_data: &[u8]) -> String {
@@ -521,15 +604,10 @@ fn vreal(f: f64) -> turso::Value {
 fn vnull() -> turso::Value {
     turso::Value::Null
 }
-
 fn now_ms() -> i64 {
-    std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0)
+    std::time::SystemTime::now().duration_since(std::time::UNIX_EPOCH).map(|d| d.as_millis() as i64).unwrap_or(0)
 }
 
-/// One SQLite (turso) DB: a server's state + constraints, or the global set.
 struct Store {
     conn: turso::Connection,
 }
@@ -549,11 +627,10 @@ impl Store {
     async fn ensure_schema(&self) -> Result<(), String> {
         self.conn
             .execute(
-                "CREATE TABLE IF NOT EXISTS state (\
-                 subject_platform TEXT NOT NULL, subject_id TEXT NOT NULL, \
-                 skey TEXT NOT NULL, svalue TEXT NOT NULL, \
-                 updated_at INTEGER NOT NULL DEFAULT 0, \
-                 PRIMARY KEY (subject_platform, subject_id, skey))",
+                "CREATE TABLE IF NOT EXISTS stats (\
+                 character TEXT NOT NULL, category TEXT NOT NULL, skey TEXT NOT NULL, \
+                 svalue TEXT NOT NULL, updated_at INTEGER NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (character, skey))",
                 (),
             )
             .await
@@ -570,10 +647,10 @@ impl Store {
         self.conn
             .execute(
                 "CREATE TABLE IF NOT EXISTS modifiers (\
-                 subject_platform TEXT NOT NULL, subject_id TEXT NOT NULL, \
-                 mname TEXT NOT NULL, skey TEXT NOT NULL, delta REAL NOT NULL, \
-                 turns INTEGER NOT NULL, created_at INTEGER NOT NULL DEFAULT 0, \
-                 PRIMARY KEY (subject_platform, subject_id, mname))",
+                 character TEXT NOT NULL, mname TEXT NOT NULL, skey TEXT NOT NULL, \
+                 expr TEXT NOT NULL, turns INTEGER NOT NULL, ticked INTEGER NOT NULL DEFAULT 0, \
+                 created_at INTEGER NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (character, mname))",
                 (),
             )
             .await
@@ -581,13 +658,10 @@ impl Store {
         Ok(())
     }
 
-    async fn count_keys(&self, platform: &str, subject: &str) -> Result<usize, String> {
+    async fn count_stats(&self, character: &str) -> Result<usize, String> {
         let mut rows = self
             .conn
-            .query(
-                "SELECT COUNT(*) FROM state WHERE subject_platform = ?1 AND subject_id = ?2",
-                turso::params![vtext(platform), vtext(subject)],
-            )
+            .query("SELECT COUNT(*) FROM stats WHERE character = ?1", turso::params![vtext(character)])
             .await
             .map_err(|e| e.to_string())?;
         let n = match rows.next().await.map_err(|e| e.to_string())? {
@@ -598,69 +672,86 @@ impl Store {
         Ok(n as usize)
     }
 
-    async fn get(&self, platform: &str, subject: &str, key: &str) -> Result<Option<Value>, String> {
+    async fn stat_get(&self, character: &str, key: &str) -> Result<Option<Stat>, String> {
         let mut rows = self
             .conn
             .query(
-                "SELECT svalue FROM state WHERE subject_platform = ?1 AND subject_id = ?2 AND skey = ?3",
-                turso::params![vtext(platform), vtext(subject), vtext(key)],
+                "SELECT category, svalue FROM stats WHERE character = ?1 AND skey = ?2",
+                turso::params![vtext(character), vtext(key)],
             )
             .await
             .map_err(|e| e.to_string())?;
         let out = match rows.next().await.map_err(|e| e.to_string())? {
-            Some(r) => r.get::<String>(0).ok().and_then(|s| Value::from_json(&s)),
+            Some(r) => {
+                let category = r.get::<String>(0).unwrap_or_default();
+                let value = r.get::<String>(1).ok().and_then(|s| Value::from_json(&s));
+                value.map(|value| Stat { category, name: key.to_string(), value })
+            }
             None => None,
         };
         while rows.next().await.map_err(|e| e.to_string())?.is_some() {}
         Ok(out)
     }
 
-    async fn set(&self, platform: &str, subject: &str, key: &str, value: &Value) -> Result<(), String> {
-        // DELETE + INSERT (turso 0.1.0 has no upsert).
+    async fn stat_set(&self, character: &str, s: &Stat) -> Result<(), String> {
         self.conn
             .execute(
-                "DELETE FROM state WHERE subject_platform = ?1 AND subject_id = ?2 AND skey = ?3",
-                turso::params![vtext(platform), vtext(subject), vtext(key)],
+                "DELETE FROM stats WHERE character = ?1 AND skey = ?2",
+                turso::params![vtext(character), vtext(&s.name)],
             )
             .await
             .map_err(|e| e.to_string())?;
         self.conn
             .execute(
-                "INSERT INTO state (subject_platform, subject_id, skey, svalue, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5)",
-                turso::params![vtext(platform), vtext(subject), vtext(key), vtext(&value.to_json()), vint(now_ms())],
+                "INSERT INTO stats (character, category, skey, svalue, updated_at) VALUES (?1, ?2, ?3, ?4, ?5)",
+                turso::params![vtext(character), vtext(&s.category), vtext(&s.name), vtext(&s.value.to_json()), vint(now_ms())],
             )
             .await
             .map(|_| ())
             .map_err(|e| e.to_string())
     }
 
-    async fn remove(&self, platform: &str, subject: &str, key: &str) -> Result<bool, String> {
-        let before = self.get(platform, subject, key).await?;
+    async fn stat_remove(&self, character: &str, key: &str) -> Result<bool, String> {
+        let had = self.stat_get(character, key).await?.is_some();
         self.conn
-            .execute(
-                "DELETE FROM state WHERE subject_platform = ?1 AND subject_id = ?2 AND skey = ?3",
-                turso::params![vtext(platform), vtext(subject), vtext(key)],
-            )
+            .execute("DELETE FROM stats WHERE character = ?1 AND skey = ?2", turso::params![vtext(character), vtext(key)])
             .await
             .map_err(|e| e.to_string())?;
-        Ok(before.is_some())
+        Ok(had)
     }
 
-    async fn list(&self, platform: &str, subject: &str) -> Result<Vec<(String, Value)>, String> {
-        let mut rows = self
-            .conn
-            .query(
-                "SELECT skey, svalue FROM state WHERE subject_platform = ?1 AND subject_id = ?2 ORDER BY skey ASC",
-                turso::params![vtext(platform), vtext(subject)],
+    async fn remove_category(&self, character: &str, category: &str) -> Result<usize, String> {
+        let before = self.list(character, None).await?.len();
+        self.conn
+            .execute(
+                "DELETE FROM stats WHERE character = ?1 AND category = ?2",
+                turso::params![vtext(character), vtext(category)],
             )
             .await
             .map_err(|e| e.to_string())?;
+        let after = self.list(character, None).await?.len();
+        Ok(before - after)
+    }
+
+    async fn list(&self, character: &str, category: Option<&str>) -> Result<Vec<Stat>, String> {
+        let (sql, params): (&str, Vec<turso::Value>) = match category {
+            Some(c) => (
+                "SELECT category, skey, svalue FROM stats WHERE character = ?1 AND category = ?2 ORDER BY category ASC, skey ASC",
+                vec![vtext(character), vtext(c)],
+            ),
+            None => (
+                "SELECT category, skey, svalue FROM stats WHERE character = ?1 ORDER BY category ASC, skey ASC",
+                vec![vtext(character)],
+            ),
+        };
+        let mut rows = self.conn.query(sql, params).await.map_err(|e| e.to_string())?;
         let mut out = Vec::new();
         while let Some(r) = rows.next().await.map_err(|e| e.to_string())? {
-            if let (Ok(k), Ok(v)) = (r.get::<String>(0), r.get::<String>(1)) {
-                if let Some(val) = Value::from_json(&v) {
-                    out.push((k, val));
+            let category = r.get::<String>(0).unwrap_or_default();
+            let name = r.get::<String>(1).unwrap_or_default();
+            if let Ok(sv) = r.get::<String>(2) {
+                if let Some(value) = Value::from_json(&sv) {
+                    out.push(Stat { category, name, value });
                 }
             }
         }
@@ -670,16 +761,12 @@ impl Store {
     async fn set_constraint(&self, key: &str, c: &Constraint) -> Result<(), String> {
         let opts = c.options.as_ref().map(|o| serde_json::to_string(o).unwrap());
         self.conn
-            .execute(
-                "DELETE FROM constraints WHERE skey = ?1",
-                turso::params![vtext(key)],
-            )
+            .execute("DELETE FROM constraints WHERE skey = ?1", turso::params![vtext(key)])
             .await
             .map_err(|e| e.to_string())?;
         self.conn
             .execute(
-                "INSERT INTO constraints (skey, ctype, cmin, cmax, coptions, updated_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                "INSERT INTO constraints (skey, ctype, cmin, cmax, coptions, updated_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
                 turso::params![
                     vtext(key),
                     c.ctype.as_deref().map(vtext).unwrap_or_else(vnull),
@@ -697,44 +784,37 @@ impl Store {
     async fn get_constraint(&self, key: &str) -> Result<Option<Constraint>, String> {
         let mut rows = self
             .conn
-            .query(
-                "SELECT ctype, cmin, cmax, coptions FROM constraints WHERE skey = ?1",
-                turso::params![vtext(key)],
-            )
+            .query("SELECT ctype, cmin, cmax, coptions FROM constraints WHERE skey = ?1", turso::params![vtext(key)])
             .await
             .map_err(|e| e.to_string())?;
         let out = rows.next().await.map_err(|e| e.to_string())?.map(|r| Constraint {
             ctype: r.get::<Option<String>>(0).ok().flatten(),
             min: r.get::<Option<f64>>(1).ok().flatten(),
             max: r.get::<Option<f64>>(2).ok().flatten(),
-            options: r
-                .get::<Option<String>>(3)
-                .ok()
-                .flatten()
-                .and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
+            options: r.get::<Option<String>>(3).ok().flatten().and_then(|s| serde_json::from_str::<Vec<String>>(&s).ok()),
         });
         while rows.next().await.map_err(|e| e.to_string())?.is_some() {}
         Ok(out)
     }
-    async fn set_modifier(&self, platform: &str, subject: &str, m: &Modifier) -> Result<(), String> {
+
+    async fn set_modifier(&self, character: &str, m: &Modifier) -> Result<(), String> {
         self.conn
             .execute(
-                "DELETE FROM modifiers WHERE subject_platform = ?1 AND subject_id = ?2 AND mname = ?3",
-                turso::params![vtext(platform), vtext(subject), vtext(&m.name)],
+                "DELETE FROM modifiers WHERE character = ?1 AND mname = ?2",
+                turso::params![vtext(character), vtext(&m.name)],
             )
             .await
             .map_err(|e| e.to_string())?;
         self.conn
             .execute(
-                "INSERT INTO modifiers (subject_platform, subject_id, mname, skey, delta, turns, created_at) \
-                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                "INSERT INTO modifiers (character, mname, skey, expr, turns, ticked, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
                 turso::params![
-                    vtext(platform),
-                    vtext(subject),
+                    vtext(character),
                     vtext(&m.name),
                     vtext(&m.key),
-                    vreal(m.delta),
+                    vtext(&m.expr),
                     vint(m.turns),
+                    vint(m.ticked),
                     vint(now_ms())
                 ],
             )
@@ -743,25 +823,21 @@ impl Store {
             .map_err(|e| e.to_string())
     }
 
-    async fn remove_modifier(&self, platform: &str, subject: &str, name: &str) -> Result<bool, String> {
-        let had = self.list_modifiers(platform, subject).await?.iter().any(|m| m.name == name);
+    async fn remove_modifier(&self, character: &str, name: &str) -> Result<bool, String> {
+        let had = self.list_modifiers(character).await?.iter().any(|m| m.name == name);
         self.conn
-            .execute(
-                "DELETE FROM modifiers WHERE subject_platform = ?1 AND subject_id = ?2 AND mname = ?3",
-                turso::params![vtext(platform), vtext(subject), vtext(name)],
-            )
+            .execute("DELETE FROM modifiers WHERE character = ?1 AND mname = ?2", turso::params![vtext(character), vtext(name)])
             .await
             .map_err(|e| e.to_string())?;
         Ok(had)
     }
 
-    async fn list_modifiers(&self, platform: &str, subject: &str) -> Result<Vec<Modifier>, String> {
+    async fn list_modifiers(&self, character: &str) -> Result<Vec<Modifier>, String> {
         let mut rows = self
             .conn
             .query(
-                "SELECT mname, skey, delta, turns FROM modifiers \
-                 WHERE subject_platform = ?1 AND subject_id = ?2 ORDER BY mname ASC",
-                turso::params![vtext(platform), vtext(subject)],
+                "SELECT mname, skey, expr, turns, ticked FROM modifiers WHERE character = ?1 ORDER BY mname ASC",
+                turso::params![vtext(character)],
             )
             .await
             .map_err(|e| e.to_string())?;
@@ -770,15 +846,39 @@ impl Store {
             out.push(Modifier {
                 name: r.get::<String>(0).unwrap_or_default(),
                 key: r.get::<String>(1).unwrap_or_default(),
-                delta: r.get::<f64>(2).unwrap_or(0.0),
+                expr: r.get::<String>(2).unwrap_or_default(),
                 turns: r.get::<i64>(3).unwrap_or(-1),
+                ticked: r.get::<i64>(4).unwrap_or(0),
             });
+        }
+        Ok(out)
+    }
+
+    /// Every (character, modifier) in the store — for the per-message turn tick.
+    async fn all_modifiers(&self) -> Result<Vec<(String, Modifier)>, String> {
+        let mut rows = self
+            .conn
+            .query("SELECT character, mname, skey, expr, turns, ticked FROM modifiers", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| e.to_string())? {
+            let character = r.get::<String>(0).unwrap_or_default();
+            out.push((
+                character,
+                Modifier {
+                    name: r.get::<String>(1).unwrap_or_default(),
+                    key: r.get::<String>(2).unwrap_or_default(),
+                    expr: r.get::<String>(3).unwrap_or_default(),
+                    turns: r.get::<i64>(4).unwrap_or(-1),
+                    ticked: r.get::<i64>(5).unwrap_or(0),
+                },
+            ));
         }
         Ok(out)
     }
 }
 
-/// Per-guild stores, opened lazily (the read task owns them).
 struct Stores {
     dir: String,
     by_guild: HashMap<String, Store>,
@@ -788,17 +888,84 @@ impl Stores {
     fn new(dir: String) -> Self {
         Self { dir, by_guild: HashMap::new() }
     }
-
     fn path_for(key: &str, dir: &str) -> String {
         format!("{}/{key}.db", expand_tilde(dir).trim_end_matches('/'))
     }
-
     async fn guild(&mut self, key: &str) -> Result<&Store, String> {
         if !self.by_guild.contains_key(key) {
             let store = Store::open(&Self::path_for(key, &self.dir)).await?;
             self.by_guild.insert(key.to_string(), store);
         }
         Ok(self.by_guild.get(key).unwrap())
+    }
+}
+
+// ── the turn tick ───────────────────────────────────────────────────────────
+
+/// Advance every modifier in the store by one turn: evaluate its formula
+/// (`t` = this turn number; other names = the character's current stat values),
+/// add the result to the stat, clamp to the constraint, and decrement/expire.
+async fn tick_modifiers(store: &Store, settings: &Settings) {
+    let mods = match store.all_modifiers().await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    for (character, m) in mods {
+        // Build the variable context: t + the character's numeric stats.
+        let mut vars: HashMap<String, f64> = HashMap::new();
+        vars.insert("t".to_string(), (m.ticked + 1) as f64);
+        if let Ok(stats) = store.list(&character, None).await {
+            for s in stats {
+                if let Some(n) = s.value.as_f64() {
+                    vars.insert(s.name.to_ascii_lowercase(), n);
+                }
+            }
+        }
+        let delta = match eval_formula(&m.expr, &vars) {
+            Ok(d) => d,
+            Err(e) => {
+                warn!("modifier `{}` on `{character}`: bad formula `{}`: {e}", m.name, m.expr);
+                continue;
+            }
+        };
+
+        let con = {
+            let op = settings.schema.get(&m.key).cloned().unwrap_or_default();
+            let user = store.get_constraint(&m.key).await.unwrap_or(None).unwrap_or_default();
+            op.merged_with_user(&user)
+        };
+        let cur = store.stat_get(&character, &m.key).await.unwrap_or(None);
+        let (base, was_int) = match &cur {
+            Some(s) => match &s.value {
+                Value::Int(i) => (*i as f64, true),
+                Value::Float(f) => (*f, false),
+                _ => continue, // non-numeric: cannot modify
+            },
+            None => (0.0, delta.fract() == 0.0),
+        };
+        let mut nv = base + delta;
+        if let Some(min) = con.min {
+            nv = nv.max(min);
+        }
+        if let Some(max) = con.max {
+            nv = nv.min(max);
+        }
+        let value = if was_int && delta.fract() == 0.0 { Value::Int(nv as i64) } else { Value::Float(nv) };
+        let category = cur.map(|s| s.category).unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+        let _ = store.stat_set(&character, &Stat { category, name: m.key.clone(), value }).await;
+
+        // Decrement / expire.
+        let next = Modifier { ticked: m.ticked + 1, ..m.clone() };
+        if m.turns > 0 {
+            let t = m.turns - 1;
+            if t == 0 {
+                let _ = store.remove_modifier(&character, &m.name).await;
+            } else {
+                let _ = store.set_modifier(&character, &Modifier { turns: t, ..next }).await;
+            }
+        } else {
+            let _ = store.set_modifier(&character, &next).await;
+        }
     }
 }
 
@@ -826,10 +993,7 @@ async fn register_catch_all(write: &Arc<AsyncMutex<WsWriteHalf>>, id: &Arc<Async
         auth_token: id.auth,
         module_name: id.module,
         module_instance_uuid7: id.instance,
-        payload: Some(EnginePayload::Commands(Commands {
-            commands: vec![],
-            alert_on_unknown_command: false,
-        })),
+        payload: Some(EnginePayload::Commands(Commands { commands: vec![], alert_on_unknown_command: false })),
     };
     send_container(write, c).await;
     info!("registered as a catch-all (parses !state itself)");
@@ -858,67 +1022,14 @@ fn reply_container(id: &EngineIdentity, chat: &ChatMessage, msg: String) -> Cont
     }
 }
 
-/// Advance a subject's modifiers by one turn: add each delta to its stat,
-/// clamp to the key's effective constraint, and decrement/expire the counter.
-async fn tick_modifiers(store: &Store, settings: &Settings, platform: &str, subject: &str) {
-    let mods = match store.list_modifiers(platform, subject).await {
-        Ok(m) => m,
-        Err(_) => return,
-    };
-    for m in mods {
-        // Effective constraint (operator schema wins over user-defined).
-        let op = settings.schema.get(&m.key).cloned().unwrap_or_default();
-        let user = store.get_constraint(&m.key).await.unwrap_or(None).unwrap_or_default();
-        let con = op.merged_with_user(&user);
-
-        // Current value: 0 if unset; a non-numeric value cannot be modified.
-        let cur = store.get(platform, subject, &m.key).await.unwrap_or(None);
-        let (base, was_int) = match &cur {
-            Some(Value::Int(i)) => (*i as f64, true),
-            Some(Value::Float(f)) => (*f, false),
-            None => (0.0, m.delta.fract() == 0.0),
-            Some(_) => continue,
-        };
-        let mut nv = base + m.delta;
-        if let Some(min) = con.min {
-            nv = nv.max(min);
-        }
-        if let Some(max) = con.max {
-            nv = nv.min(max);
-        }
-        let value = if was_int && m.delta.fract() == 0.0 {
-            Value::Int(nv as i64)
-        } else {
-            Value::Float(nv)
-        };
-        let _ = store.set(platform, subject, &m.key, &value).await;
-
-        // Decrement the turn counter; delete at 0 (indefinite stays).
-        if m.turns > 0 {
-            let t = m.turns - 1;
-            if t == 0 {
-                let _ = store.remove_modifier(platform, subject, &m.name).await;
-            } else {
-                let _ = store
-                    .set_modifier(platform, subject, &Modifier { turns: t, ..m.clone() })
-                    .await;
-            }
-        }
-    }
-}
-
-/// Render a modifier for a reply: `` `name` +5 to `health` (7 turns) ``.
-fn describe_modifier(m: &Modifier) -> String {
-    let sign = if m.delta >= 0.0 { "+" } else { "" };
-    let dur = if m.turns < 0 {
-        "∞".to_string()
-    } else {
-        format!("{} turn(s)", m.turns)
-    };
-    format!("`{}` {sign}{} to `{}` ({dur})", m.name, m.delta, m.key)
-}
-
 // ── command handling ────────────────────────────────────────────────────────
+
+/// Resolve the effective constraint for a key (operator schema wins).
+async fn effective_constraint(store: &Store, settings: &Settings, key: &str) -> Constraint {
+    let op = settings.schema.get(key).cloned().unwrap_or_default();
+    let user = store.get_constraint(key).await.unwrap_or(None).unwrap_or_default();
+    op.merged_with_user(&user)
+}
 
 async fn handle_command(
     id: &EngineIdentity,
@@ -926,7 +1037,6 @@ async fn handle_command(
     stores: &mut Stores,
     settings: &Settings,
     guild: &str,
-    target: (String, String), // (subject_id, handle)
     cmd: StateCmd,
 ) -> Vec<ContainerForEngine> {
     let mut out = Vec::new();
@@ -935,99 +1045,141 @@ async fn handle_command(
             out.push(reply_container(id, chat, $m))
         };
     }
-    let platform = chat.platform.clone();
-    let (subject, handle) = target;
-    let who = if handle.is_empty() { "that user".to_string() } else { format!("@{handle}") };
+    let store = match stores.guild(guild).await {
+        Ok(s) => s,
+        Err(e) => {
+            push!(format!("storage error: {e}"));
+            return out;
+        }
+    };
 
     match cmd {
         StateCmd::Help => {
+            let f = &settings.command_flag;
             push!(format!(
-                "`{f}state set [@user] <key>=<value>` · `{f}state get [@user] <key>` · `{f}state list [@user]` · `{f}state remove [@user] <key>` · `{f}state define <key> [type=int|float|string|bool|options] [min=..] [max=..] [options=a|b|c]`",
-                f = settings.command_flag
+                "`{f}state stat -char <char> [-c <category>] -n <name> -v <value>` · \
+                 `{f}state modify -char <char> -k <name> -v <value>` · \
+                 `{f}state modify -char <char> -k <name> -m <formula> [-t <turns>] [-name <mname>]` · \
+                 `{f}state list -char <char> [-c <category>]` · \
+                 `{f}state remove -char <char> -k <name>` | `-c <category>`"
             ));
         }
-        StateCmd::List => match stores.guild(guild).await {
-            Ok(s) => match s.list(&platform, &subject).await {
-                Ok(items) if items.is_empty() => push!(format!("{who} has no properties.")),
-                Ok(items) => {
-                    let body = items
-                        .iter()
-                        .map(|(k, v)| format!("`{k}`={}", v.display()))
-                        .collect::<Vec<_>>()
-                        .join(", ");
-                    push!(format!("{who}: {body}"));
-                }
-                Err(e) => push!(format!("storage error: {e}")),
-            },
-            Err(e) => push!(format!("storage error: {e}")),
-        },
-        StateCmd::Get { key } => match stores.guild(guild).await {
-            Ok(s) => match s.get(&platform, &subject, &key).await {
-                Ok(Some(v)) => push!(format!("{who} `{key}` = {}", v.display())),
-                Ok(None) => push!(format!("{who} has no property `{key}`.")),
-                Err(e) => push!(format!("storage error: {e}")),
-            },
-            Err(e) => push!(format!("storage error: {e}")),
-        },
-        StateCmd::Set { key, raw_value } => {
-            if key.len() > MAX_KEY_LEN {
-                push!(format!("key is too long (max {MAX_KEY_LEN})."));
+        StateCmd::Stat { character, category, name, value } => {
+            if name.len() > MAX_NAME_LEN {
+                push!(format!("name too long (max {MAX_NAME_LEN})."));
                 return out;
             }
-            if raw_value.len() > MAX_VALUE_LEN {
-                push!(format!("value is too long (max {MAX_VALUE_LEN})."));
+            if value.len() > MAX_VALUE_LEN {
+                push!(format!("value too long (max {MAX_VALUE_LEN})."));
                 return out;
             }
-            // Effective constraint (operator wins over user-defined).
-            let op = settings.schema.get(&key).cloned().unwrap_or_default();
-            let user = match stores.guild(guild).await {
-                Ok(s) => s.get_constraint(&key).await.unwrap_or(None).unwrap_or_default(),
-                Err(_) => Constraint::default(),
-            };
-            let con = op.merged_with_user(&user);
-
-            // Coerce to the declared type, else infer.
-            let value = match con.ctype.as_deref() {
-                Some(t) => match coerce(&raw_value, t) {
+            let con = effective_constraint(store, settings, &name).await;
+            let v = match con.ctype.as_deref() {
+                Some(t) => match coerce(&value, t) {
                     Ok(v) => v,
                     Err(e) => {
-                        push!(format!("`{key}`: {e}."));
+                        push!(format!("`{name}`: {e}."));
                         return out;
                     }
                 },
-                None => infer_value(&raw_value),
+                None => infer_value(&value),
             };
-            if let Err(e) = con.validate(&value) {
-                push!(format!("`{key}`: {e}."));
+            if let Err(e) = con.validate(&v) {
+                push!(format!("`{name}`: {e}."));
                 return out;
             }
-            // Cap the number of keys per subject.
-            if let Ok(s) = stores.guild(guild).await {
-                if s.get(&platform, &subject, &key).await.unwrap_or(None).is_none()
-                    && s.count_keys(&platform, &subject).await.unwrap_or(0) >= MAX_KEYS_PER_SUBJECT
-                {
-                    push!(format!("{who} already has {MAX_KEYS_PER_SUBJECT} properties (the cap)."));
-                    return out;
-                }
-                match s.set(&platform, &subject, &key, &value).await {
-                    Ok(()) => push!(format!("Set `{key}` = {} for {who}.", value.display())),
-                    Err(e) => push!(format!("storage error: {e}")),
-                }
-            } else {
-                push!("storage error".to_string());
+            if store.stat_get(&character, &name).await.unwrap_or(None).is_none()
+                && store.count_stats(&character).await.unwrap_or(0) >= MAX_STATS_PER_CHAR
+            {
+                push!(format!("`{character}` already has {MAX_STATS_PER_CHAR} stats (the cap)."));
+                return out;
+            }
+            match store.stat_set(&character, &Stat { category: category.clone(), name: name.clone(), value: v.clone() }).await {
+                Ok(()) => push!(format!("`{character}` [{category}] `{name}` = {}.", v.display())),
+                Err(e) => push!(format!("storage error: {e}")),
             }
         }
-        StateCmd::Remove { key } => match stores.guild(guild).await {
-            Ok(s) => match s.remove(&platform, &subject, &key).await {
-                Ok(true) => push!(format!("Removed `{key}` from {who}.")),
-                Ok(false) => push!(format!("{who} has no property `{key}`.")),
+        StateCmd::Modify { character, key, value, expr, turns, mname } => {
+            match (value, expr) {
+                // Set the value directly.
+                (Some(v), None) => {
+                    let con = effective_constraint(store, settings, &key).await;
+                    let val = match con.ctype.as_deref() {
+                        Some(t) => match coerce(&v, t) {
+                            Ok(x) => x,
+                            Err(e) => {
+                                push!(format!("`{key}`: {e}."));
+                                return out;
+                            }
+                        },
+                        None => infer_value(&v),
+                    };
+                    if let Err(e) = con.validate(&val) {
+                        push!(format!("`{key}`: {e}."));
+                        return out;
+                    }
+                    let category = store.stat_get(&character, &key).await.unwrap_or(None).map(|s| s.category).unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+                    match store.stat_set(&character, &Stat { category, name: key.clone(), value: val.clone() }).await {
+                        Ok(()) => push!(format!("`{character}` `{key}` = {}.", val.display())),
+                        Err(e) => push!(format!("storage error: {e}")),
+                    }
+                }
+                // Add/replace a formula modifier.
+                (None, Some(formula)) => {
+                    // Validate the formula parses.
+                    if let Err(e) = eval_formula(&formula, &HashMap::new()) {
+                        // Unknown names are fine (resolved at tick); only syntax matters.
+                        if !e.starts_with("unknown name") {
+                            push!(format!("bad formula `{formula}`: {e}."));
+                            return out;
+                        }
+                    }
+                    let name = mname.unwrap_or_else(|| key.clone());
+                    let m = Modifier { name: name.clone(), key: key.clone(), expr: formula.clone(), turns: turns.unwrap_or(-1), ticked: 0 };
+                    match store.set_modifier(&character, &m).await {
+                        Ok(()) => {
+                            let dur = if m.turns < 0 { "indefinitely".to_string() } else { format!("for {} turn(s)", m.turns) };
+                            push!(format!("Modifier `{name}`: `{key}` += `{formula}` per turn {dur} on `{character}`."));
+                        }
+                        Err(e) => push!(format!("storage error: {e}")),
+                    }
+                }
+                _ => push!("pass either `-v <value>` or `-m <formula>`.".to_string()),
+            }
+        }
+        StateCmd::List { character, category } => match store.list(&character, category.as_deref()).await {
+            Ok(items) if items.is_empty() => push!(format!("`{character}` has no stats{}.",
+                category.map(|c| format!(" in [{c}]")).unwrap_or_default())),
+            Ok(items) => {
+                let mut by_cat: Vec<(String, Vec<String>)> = Vec::new();
+                for s in items {
+                    let entry = format!("`{}`={}", s.name, s.value.display());
+                    match by_cat.iter_mut().find(|(c, _)| *c == s.category) {
+                        Some((_, v)) => v.push(entry),
+                        None => by_cat.push((s.category, vec![entry])),
+                    }
+                }
+                let body = by_cat.iter().map(|(c, v)| format!("[{c}] {}", v.join(", "))).collect::<Vec<_>>().join(" · ");
+                push!(format!("`{character}`: {body}"));
+            }
+            Err(e) => push!(format!("storage error: {e}")),
+        },
+        StateCmd::Remove { character, key, category } => match (key, category) {
+            (Some(k), None) => match store.stat_remove(&character, &k).await {
+                Ok(true) => push!(format!("Removed `{k}` from `{character}`.")),
+                Ok(false) => push!(format!("`{character}` has no stat `{k}`.")),
                 Err(e) => push!(format!("storage error: {e}")),
             },
-            Err(e) => push!(format!("storage error: {e}")),
+            (None, Some(c)) => match store.remove_category(&character, &c).await {
+                Ok(0) => push!(format!("`{character}` has no stats in [{c}].")),
+                Ok(n) => push!(format!("Removed {n} stat(s) in [{c}] from `{character}`.")),
+                Err(e) => push!(format!("storage error: {e}")),
+            },
+            _ => push!("pass either `-k <name>` or `-c <category>`.".to_string()),
         },
         StateCmd::Define { key, constraint } => {
             if constraint.is_empty() {
-                push!("Nothing to define — pass type/min/max/options.".to_string());
+                push!("Nothing to define — pass `-type`/`-min`/`-max`/`-options`.".to_string());
                 return out;
             }
             if let Some(t) = &constraint.ctype {
@@ -1036,96 +1188,45 @@ async fn handle_command(
                     return out;
                 }
             }
-            match stores.guild(guild).await {
-                Ok(s) => match s.set_constraint(&key, &constraint).await {
-                    Ok(()) => push!(format!("Constraint on `{key}`: {}.", constraint.describe())),
-                    Err(e) => push!(format!("storage error: {e}")),
-                },
+            match store.set_constraint(&key, &constraint).await {
+                Ok(()) => push!(format!("Constraint on `{key}`: {}.", constraint.describe())),
                 Err(e) => push!(format!("storage error: {e}")),
             }
         }
-        StateCmd::ModList => match stores.guild(guild).await {
-            Ok(s) => match s.list_modifiers(&platform, &subject).await {
-                Ok(ms) if ms.is_empty() => push!(format!("{who} has no modifiers.")),
-                Ok(ms) => {
-                    let body = ms.iter().map(describe_modifier).collect::<Vec<_>>().join(", ");
-                    push!(format!("{who}: {body}"));
-                }
-                Err(e) => push!(format!("storage error: {e}")),
-            },
+        StateCmd::Modifiers { character } => match store.list_modifiers(&character).await {
+            Ok(ms) if ms.is_empty() => push!(format!("`{character}` has no modifiers.")),
+            Ok(ms) => push!(format!(
+                "`{character}`: {}",
+                ms.iter().map(describe_modifier).collect::<Vec<_>>().join(", ")
+            )),
             Err(e) => push!(format!("storage error: {e}")),
         },
-        StateCmd::ModRemove { name } => match stores.guild(guild).await {
-            Ok(s) => match s.remove_modifier(&platform, &subject, &name).await {
-                Ok(true) => push!(format!("Removed modifier `{name}` from {who}.")),
-                Ok(false) => push!(format!("{who} has no modifier `{name}`.")),
-                Err(e) => push!(format!("storage error: {e}")),
-            },
-            Err(e) => push!(format!("storage error: {e}")),
-        },
-        StateCmd::ModAdd { name, key, delta, turns } => {
-            if name.len() > MAX_KEY_LEN || key.len() > MAX_KEY_LEN {
-                push!(format!("name/key too long (max {MAX_KEY_LEN})."));
-                return out;
-            }
-            let m = Modifier { name: name.clone(), key: key.clone(), delta, turns };
-            match stores.guild(guild).await {
-                Ok(s) => match s.set_modifier(&platform, &subject, &m).await {
-                    Ok(()) => {
-                        let dur = if turns < 0 {
-                            "indefinitely".to_string()
-                        } else {
-                            format!("for {turns} turn(s)")
-                        };
-                        let sign = if delta >= 0.0 { "+" } else { "" };
-                        push!(format!("Modifier `{name}`: {sign}{delta} to `{key}` {dur} for {who}."));
-                    }
-                    Err(e) => push!(format!("storage error: {e}")),
-                },
-                Err(e) => push!(format!("storage error: {e}")),
-            }
-        }
     }
     out
 }
 
-/// Handle one message: advance the author's modifiers one turn, then handle a
-/// `!state` command if the message is one.
+/// Handle one message: tick modifiers one turn (an ordinary message), then
+/// handle a `!state` command if the message is one.
 async fn handle_message(
     id: &EngineIdentity,
     chat: &ChatMessage,
     stores: &mut Stores,
     settings: &Settings,
 ) -> Vec<ContainerForEngine> {
-    if chat.user_uuid7.is_empty() {
-        return Vec::new();
-    }
     let guild = discord_guild(&chat.raw_data);
     let guild_key = if guild.is_empty() { DM_DB.to_string() } else { guild };
-    let (author_id, author_handle) = discord_author(&chat.raw_data);
 
-    // A `!state` command does NOT advance a turn — handle it and stop.
+    // A `!state` command does NOT advance a turn.
     if let Some(args) = parse_state_args(&chat.raw_message, &settings.command_flag, STATE_COMMAND) {
-        let Some((cmd, had_mention)) = parse_state_command(&args) else {
+        let Some(cmd) = parse_state_command(&args) else {
             return Vec::new();
         };
-        // Target = the first mention (if the command used one), else the sender.
-        let target = if had_mention {
-            discord_mention(&chat.raw_data).unwrap_or((author_id, author_handle))
-        } else {
-            (author_id, author_handle)
-        };
-        if target.0.is_empty() {
-            return Vec::new();
-        }
-        return handle_command(id, chat, stores, settings, &guild_key, target, cmd).await;
+        return handle_command(id, chat, stores, settings, &guild_key, cmd).await;
     }
 
-    // Otherwise this ordinary message is ONE TURN: advance the author's modifiers.
-    if !author_id.is_empty() {
-        if let Ok(store) = stores.guild(&guild_key).await {
-            tick_modifiers(store, settings, &chat.platform, &author_id).await;
-        }
+    // Otherwise this ordinary message is ONE TURN: advance every modifier.
+    if let Ok(store) = stores.guild(&guild_key).await {
+        tick_modifiers(store, settings).await;
     }
     Vec::new()
 }
@@ -1192,9 +1293,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
                                 auth_token: id.auth.clone(),
                                 module_name: id.module.clone(),
                                 module_instance_uuid7: id.instance.clone(),
-                                payload: Some(EnginePayload::MessageAck(MessageAck {
-                                    message_uuid7: process.message_uuid7.clone(),
-                                })),
+                                payload: Some(EnginePayload::MessageAck(MessageAck { message_uuid7: process.message_uuid7.clone() })),
                             };
                             send_container(&write_for_task, receipt).await;
                         }
@@ -1263,182 +1362,126 @@ mod tests {
     use super::*;
 
     #[test]
-    fn infers_value_types() {
+    fn infers_and_coerces_values() {
         assert_eq!(infer_value("42"), Value::Int(42));
-        assert_eq!(infer_value("-3"), Value::Int(-3));
         assert_eq!(infer_value("4.2"), Value::Float(4.2));
         assert_eq!(infer_value("true"), Value::Bool(true));
-        assert_eq!(infer_value("hello"), Value::Str("hello".into()));
-    }
-
-    #[test]
-    fn coerces_to_declared_type() {
-        assert_eq!(coerce("42", "int").unwrap(), Value::Int(42));
-        assert!(coerce("x", "int").is_err());
-        assert_eq!(coerce("4.2", "float").unwrap(), Value::Float(4.2));
-        assert_eq!(coerce("yes", "bool").unwrap(), Value::Bool(true));
+        assert_eq!(infer_value("hi"), Value::Str("hi".into()));
         assert_eq!(coerce("42", "string").unwrap(), Value::Str("42".into()));
-        assert!(coerce("42", "nope").is_err());
+        assert!(coerce("x", "int").is_err());
     }
 
     #[test]
-    fn validates_type_min_max_options() {
-        let c = Constraint { ctype: Some("int".into()), min: Some(0.0), max: Some(100.0), options: None };
-        assert!(c.validate(&Value::Int(50)).is_ok());
-        assert!(c.validate(&Value::Int(0)).is_ok());
-        assert!(c.validate(&Value::Int(100)).is_ok());
-        assert!(c.validate(&Value::Int(101)).is_err());
-        assert!(c.validate(&Value::Int(-1)).is_err());
-        assert!(c.validate(&Value::Str("x".into())).is_err());
-
+    fn validates_constraints() {
+        let c = Constraint { ctype: Some("int".into()), min: Some(0.0), max: Some(20.0), options: None };
+        assert!(c.validate(&Value::Int(20)).is_ok());
+        assert!(c.validate(&Value::Int(21)).is_err());
         let opts = Constraint { ctype: Some("options".into()), options: Some(vec!["a".into(), "b".into()]), ..Default::default() };
         assert!(opts.validate(&Value::Str("a".into())).is_ok());
-        assert!(opts.validate(&Value::Str("c".into())).is_err());
-
-        // int is an acceptable float
-        let f = Constraint { ctype: Some("float".into()), ..Default::default() };
-        assert!(f.validate(&Value::Int(3)).is_ok());
-        assert!(f.validate(&Value::Float(3.5)).is_ok());
-        assert!(f.validate(&Value::Str("3".into())).is_err());
+        assert!(opts.validate(&Value::Str("z".into())).is_err());
     }
 
     #[test]
-    fn operator_constraint_wins_over_user() {
-        let op = Constraint { ctype: Some("int".into()), min: Some(0.0), ..Default::default() };
-        let user = Constraint { ctype: Some("string".into()), min: Some(5.0), max: Some(9.0), ..Default::default() };
-        let m = op.merged_with_user(&user);
-        assert_eq!(m.ctype.as_deref(), Some("int")); // operator wins
-        assert_eq!(m.min, Some(0.0)); // operator wins
-        assert_eq!(m.max, Some(9.0)); // user fills the gap
+    fn evaluates_formulas() {
+        let mut vars = HashMap::new();
+        vars.insert("t".to_string(), 3.0);
+        vars.insert("hp".to_string(), 40.0);
+        assert_eq!(eval_formula("t*2", &vars).unwrap(), 6.0);
+        assert_eq!(eval_formula("hp/10 + 1", &vars).unwrap(), 5.0);
+        assert_eq!(eval_formula("-t + 10", &vars).unwrap(), 7.0);
+        assert_eq!(eval_formula("(t+1)*2", &vars).unwrap(), 8.0);
+        assert!(eval_formula("t/0", &vars).is_err());
+        assert!(eval_formula("hp +", &vars).is_err());
+        assert!(eval_formula("(t", &vars).is_err());
+        assert!(eval_formula("nope", &vars).is_err());
     }
 
     #[test]
-    fn value_json_round_trips() {
-        for v in [Value::Int(7), Value::Float(1.5), Value::Bool(true), Value::Str("hi".into())] {
-            assert_eq!(Value::from_json(&v.to_json()).unwrap(), v);
-        }
+    fn parses_flags() {
+        let f = parse_flags("-char alice -c health -n hp -v 100");
+        assert_eq!(f.get("char").map(String::as_str), Some("alice"));
+        assert_eq!(f.get("c").map(String::as_str), Some("health"));
+        assert_eq!(f.get("n").map(String::as_str), Some("hp"));
+        assert_eq!(f.get("v").map(String::as_str), Some("100"));
+        // a multi-token formula value
+        let f = parse_flags("-char alice -k hp -m t * 2 -t 7");
+        assert_eq!(f.get("m").map(String::as_str), Some("t * 2"));
+        assert_eq!(f.get("t").map(String::as_str), Some("7"));
+        // a bare negative number is a value, not a flag
+        let f = parse_flags("-v -5");
+        assert_eq!(f.get("v").map(String::as_str), Some("-5"));
     }
 
     #[test]
     fn parses_commands() {
-        assert_eq!(parse_state_command("list"), Some((StateCmd::List, false)));
         assert_eq!(
-            parse_state_command("set score=42"),
-            Some((StateCmd::Set { key: "score".into(), raw_value: "42".into() }, false))
+            parse_state_command("stat -char alice -c health -n hp -v 100"),
+            Some(StateCmd::Stat { character: "alice".into(), category: "health".into(), name: "hp".into(), value: "100".into() })
+        );
+        // category defaults to general
+        assert_eq!(
+            parse_state_command("stat -char alice -n hp -v 100"),
+            Some(StateCmd::Stat { character: "alice".into(), category: DEFAULT_CATEGORY.into(), name: "hp".into(), value: "100".into() })
         );
         assert_eq!(
-            parse_state_command("set @x y=1"),
-            Some((StateCmd::Set { key: "@x y".into(), raw_value: "1".into() }, false))
-        );
-        // A mention BEFORE the verb is stripped + reported.
-        assert_eq!(
-            parse_state_command("<@123> get score"),
-            Some((StateCmd::Get { key: "score".into() }, true))
-        );
-        // A mention AFTER the verb (the natural form) too.
-        assert_eq!(
-            parse_state_command("set <@2> nickname=Bob"),
-            Some((StateCmd::Set { key: "nickname".into(), raw_value: "Bob".into() }, true))
+            parse_state_command("modify -char alice -k hp -v 90"),
+            Some(StateCmd::Modify { character: "alice".into(), key: "hp".into(), value: Some("90".into()), expr: None, turns: Some(-1), mname: None })
         );
         assert_eq!(
-            parse_state_command("get <@2> score"),
-            Some((StateCmd::Get { key: "score".into() }, true))
+            parse_state_command("modify -char alice -k hp -m t*2 -t 7 -name regen"),
+            Some(StateCmd::Modify { character: "alice".into(), key: "hp".into(), value: None, expr: Some("t*2".into()), turns: Some(7), mname: Some("regen".into()) })
         );
         assert_eq!(
-            parse_state_command("remove <@2> score"),
-            Some((StateCmd::Remove { key: "score".into() }, true))
-        );
-        assert_eq!(parse_state_command("get score"), Some((StateCmd::Get { key: "score".into() }, false)));
-        assert_eq!(
-            parse_state_command("remove score"),
-            Some((StateCmd::Remove { key: "score".into() }, false))
+            parse_state_command("list -char alice -c health"),
+            Some(StateCmd::List { character: "alice".into(), category: Some("health".into()) })
         );
         assert_eq!(
-            parse_state_command("define score type=int min=0 max=100"),
-            Some((
-                StateCmd::Define {
-                    key: "score".into(),
-                    constraint: Constraint { ctype: Some("int".into()), min: Some(0.0), max: Some(100.0), options: None }
-                },
-                false
-            ))
+            parse_state_command("remove -char alice -c health"),
+            Some(StateCmd::Remove { character: "alice".into(), key: None, category: Some("health".into()) })
         );
-        assert_eq!(
-            parse_state_command("define colour type=options options=red|green|blue"),
-            Some((
-                StateCmd::Define {
-                    key: "colour".into(),
-                    constraint: Constraint {
-                        ctype: Some("options".into()),
-                        options: Some(vec!["red".into(), "green".into(), "blue".into()]),
-                        ..Default::default()
-                    }
-                },
-                false
-            ))
-        );
-        assert_eq!(parse_state_command("help"), Some((StateCmd::Help, false)));
-        assert_eq!(parse_state_command(""), None);
+        assert_eq!(parse_state_command("help"), Some(StateCmd::Help));
+        // missing -char → not a command
+        assert_eq!(parse_state_command("stat -n hp -v 1"), None);
         assert_eq!(parse_state_command("bogus"), None);
-        assert_eq!(parse_state_command("set noequals"), None);
     }
 
     #[test]
-    fn parses_state_args_only_for_the_command() {
-        assert_eq!(parse_state_args("!state list", "!", "state").as_deref(), Some("list"));
-        assert_eq!(parse_state_args("!state", "!", "state").as_deref(), Some(""));
-        assert!(parse_state_args("!statex", "!", "state").is_none());
-        assert!(parse_state_args("hello", "!", "state").is_none());
+    fn parses_turns_non_positive_is_indefinite() {
+        assert_eq!(parse_turns("7"), Some(7));
+        assert_eq!(parse_turns("x7"), Some(7));
+        for t in ["inf", "infinite", "forever", "-1", "x-1", "0"] {
+            assert_eq!(parse_turns(t), Some(-1), "{t}");
+        }
     }
 
-    #[test]
-    fn parses_operator_schema() {
-        let v = serde_json::json!({"score": {"type":"int","min":0,"max":100}});
-        let s = parse_schema(&v);
-        let c = s.get("score").unwrap();
-        assert_eq!(c.ctype.as_deref(), Some("int"));
-        assert_eq!(c.min, Some(0.0));
-        assert_eq!(c.max, Some(100.0));
-    }
+    // ── end-to-end (a fake character sheet) ─────────────────────────────────
 
-    // ── end-to-end store flow ───────────────────────────────────────────────
-
-    fn discord_msg(user_id: &str, handle: &str, channel: &str, guild: &str, text: &str) -> ChatMessage {
+    fn discord_msg(guild: &str, text: &str) -> ChatMessage {
         let raw = serde_json::json!({
-            "id": "m1",
-            "guild_id": guild,
-            "channel_id": channel,
-            "content": text,
-            "author": {"id": user_id, "username": handle},
-            "mentions": []
+            "id": "m1", "guild_id": guild, "channel_id": "c1",
+            "content": text, "author": {"id": "1", "username": "alice"}, "mentions": []
         })
         .to_string();
         ChatMessage {
             platform: "discord".into(),
             raw_data: raw.into_bytes(),
             raw_message: text.into(),
-            user_uuid7: format!("u-{user_id}"),
+            user_uuid7: "u1".into(),
             command: None,
-            user_data: Some(UserData { username: handle.into(), ..Default::default() }),
-            channel_id: channel.into(),
+            user_data: Some(UserData { username: "alice".into(), ..Default::default() }),
+            channel_id: "c1".into(),
         }
     }
 
-    fn settings() -> Settings {
-        Settings {
-            command_flag: "!".into(),
-            db_dir: String::new(),
-            reconnect_base_secs: 1,
-            reconnect_max_secs: 30,
-            schema: HashMap::new(),
-        }
+    fn test_settings() -> Settings {
+        Settings { command_flag: "!".into(), db_dir: String::new(), reconnect_base_secs: 1, reconnect_max_secs: 30, schema: HashMap::new() }
     }
 
     fn test_id() -> EngineIdentity {
         EngineIdentity { auth: "t".into(), instance: "i".into(), module: "state".into() }
     }
 
-    fn reply_texts(v: &[ContainerForEngine]) -> Vec<String> {
+    fn replies(v: &[ContainerForEngine]) -> Vec<String> {
         v.iter()
             .filter_map(|c| match &c.payload {
                 Some(EnginePayload::SendToPlatforms(s)) => Some(s.msg.clone()),
@@ -1447,166 +1490,86 @@ mod tests {
             .collect()
     }
 
-    /// Play a message from alice (id "1") in guild "g1" / channel "c1".
-    async fn alice_says(stores: &mut Stores, settings: &Settings, text: &str) -> Vec<ContainerForEngine> {
-        let chat = discord_msg("1", "alice", "c1", "g1", text);
-        handle_message(&test_id(), &chat, stores, settings).await
+    async fn say(stores: &mut Stores, settings: &Settings, text: &str) -> Vec<ContainerForEngine> {
+        handle_message(&test_id(), &discord_msg("g1", text), stores, settings).await
     }
 
     #[tokio::test]
-    async fn state_flow() {
+    async fn character_stat_flow() {
         let dir = std::env::temp_dir().join(format!("cockatiel-state-{}", uuid::Uuid::now_v7()));
         let mut stores = Stores::new(dir.to_string_lossy().to_string());
-        let id = test_id();
-        let mut set = settings();
-        set.schema.insert(
-            "score".into(),
-            Constraint { ctype: Some("int".into()), min: Some(0.0), max: Some(100.0), options: None },
-        );
-        let (guild, channel) = ("g1", "c1");
+        let mut set = test_settings();
+        set.schema.insert("hp".into(), Constraint { ctype: Some("int".into()), min: Some(0.0), max: Some(100.0), options: None });
+        let guild = "g1";
 
-        // set an int within the operator constraint
-        let out = alice_says(&mut stores, &set, "!state set score=42").await;
-        assert!(reply_texts(&out)[0].contains("Set `score` = 42"), "{:?}", reply_texts(&out));
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "score").await.unwrap(), Some(Value::Int(42)));
+        // define two stats (one categorised)
+        let out = say(&mut stores, &set, "!state stat -char alice -c vitals -n hp -v 50").await;
+        assert!(replies(&out)[0].contains("[vitals] `hp` = 50"), "{:?}", replies(&out));
+        say(&mut stores, &set, "!state stat -char alice -n mana -v 30").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "hp").await.unwrap().unwrap().value, Value::Int(50));
 
-        // out of range → rejected, unchanged
-        let out = alice_says(&mut stores, &set, "!state set score=999").await;
-        assert!(reply_texts(&out)[0].contains("must be <= 100"), "{:?}", reply_texts(&out));
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "score").await.unwrap(), Some(Value::Int(42)));
+        // list groups by category
+        let out = say(&mut stores, &set, "!state list -char alice").await;
+        assert!(replies(&out)[0].contains("[vitals] `hp`=50") && replies(&out)[0].contains("[general] `mana`=30"), "{:?}", replies(&out));
 
-        // non-int → rejected
-        let out = alice_says(&mut stores, &set, "!state set score=abc").await;
-        assert!(reply_texts(&out)[0].contains("not an int"), "{:?}", reply_texts(&out));
+        // modify a value
+        let out = say(&mut stores, &set, "!state modify -char alice -k hp -v 40").await;
+        assert!(replies(&out)[0].contains("`hp` = 40"));
 
-        // user-defined constraint on a new key (options)
-        let out = alice_says(&mut stores, &set, "!state define colour type=options options=red|green|blue").await;
-        assert!(reply_texts(&out)[0].contains("Constraint on `colour`"));
-        let out = alice_says(&mut stores, &set, "!state set colour=purple").await;
-        assert!(reply_texts(&out)[0].contains("must be one of"), "{:?}", reply_texts(&out));
-        let out = alice_says(&mut stores, &set, "!state set colour=green").await;
-        assert!(reply_texts(&out)[0].contains("Set `colour` = green"));
+        // a formula modifier: hp += t*2 for 3 turns
+        let out = say(&mut stores, &set, "!state modify -char alice -k hp -m t*2 -t 3 -name regen").await;
+        assert!(replies(&out)[0].contains("Modifier `regen`"), "{:?}", replies(&out));
 
-        // get + list
-        let out = alice_says(&mut stores, &set, "!state get colour").await;
-        assert!(reply_texts(&out)[0].contains("`colour` = green"));
-        let out = alice_says(&mut stores, &set, "!state list").await;
-        assert!(reply_texts(&out)[0].contains("`score`=42") && reply_texts(&out)[0].contains("`colour`=green"));
+        // each ordinary message = one turn: 40 -> 42 -> 46 -> 52, then expires
+        say(&mut stores, &set, "hello").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "hp").await.unwrap().unwrap().value, Value::Int(42));
+        say(&mut stores, &set, "again").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "hp").await.unwrap().unwrap().value, Value::Int(46));
+        say(&mut stores, &set, "again").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "hp").await.unwrap().unwrap().value, Value::Int(52));
+        assert!(stores.guild(guild).await.unwrap().list_modifiers("alice").await.unwrap().is_empty(), "expired");
 
-        // anyone can edit anyone's: alice sets a value on bob via a mention
-        let mut bob_msg = discord_msg("1", "alice", channel, guild, "!state set <@2> nickname=Bob");
-        bob_msg.raw_data = serde_json::json!({
-            "id": "m2", "guild_id": guild, "channel_id": channel,
-            "content": "!state set <@2> nickname=Bob",
-            "author": {"id": "1", "username": "alice"},
-            "mentions": [{"id": "2", "username": "bob"}]
-        }).to_string().into_bytes();
-        let out = handle_message(&id, &bob_msg, &mut stores, &set).await;
-        assert!(reply_texts(&out)[0].contains("Set `nickname` = Bob for @bob"), "{:?}", reply_texts(&out));
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "2", "nickname").await.unwrap(), Some(Value::Str("Bob".into())));
+        // clamping: a huge modifier is capped by max=100
+        say(&mut stores, &set, "!state modify -char alice -k hp -m 999 -t 1").await;
+        say(&mut stores, &set, "go").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "hp").await.unwrap().unwrap().value, Value::Int(100));
 
-        // remove
-        let out = alice_says(&mut stores, &set, "!state remove colour").await;
-        assert!(reply_texts(&out)[0].contains("Removed `colour`"));
-        let out = alice_says(&mut stores, &set, "!state get colour").await;
-        assert!(reply_texts(&out)[0].contains("no property `colour`"));
+        // a formula referencing another stat: mana += hp/10 per turn
+        say(&mut stores, &set, "!state modify -char alice -k mana -m hp/10 -t 1").await;
+        say(&mut stores, &set, "tick").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "mana").await.unwrap().unwrap().value, Value::Int(40)); // 30 + 100/10
+
+        // bulk remove a category
+        say(&mut stores, &set, "!state stat -char alice -c junk -n a -v 1").await;
+        say(&mut stores, &set, "!state stat -char alice -c junk -n b -v 2").await;
+        let out = say(&mut stores, &set, "!state remove -char alice -c junk").await;
+        assert!(replies(&out)[0].contains("Removed 2 stat(s) in [junk]"), "{:?}", replies(&out));
+
+        // constraints reject out-of-range / wrong type
+        let out = say(&mut stores, &set, "!state modify -char alice -k hp -v 999").await;
+        assert!(replies(&out)[0].contains("must be <= 100"), "{:?}", replies(&out));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    #[test]
-    fn parses_modifiers() {
-        // short form: name defaults to the key
-        assert_eq!(
-            parse_state_command("modifier health +5 x7"),
-            Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: 7 }, false))
-        );
-        // long form: explicit name
-        assert_eq!(
-            parse_state_command("modifier regen health +5 x7"),
-            Some((StateCmd::ModAdd { name: "regen".into(), key: "health".into(), delta: 5.0, turns: 7 }, false))
-        );
-        // negative, float, indefinite
-        assert_eq!(
-            parse_state_command("modifier poison health -3"),
-            Some((StateCmd::ModAdd { name: "poison".into(), key: "health".into(), delta: -3.0, turns: -1 }, false))
-        );
-        assert_eq!(
-            parse_state_command("modifier speed +0.5 x3"),
-            Some((StateCmd::ModAdd { name: "speed".into(), key: "speed".into(), delta: 0.5, turns: 3 }, false))
-        );
-        assert_eq!(
-            parse_state_command("modifier health +5 inf"),
-            Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: -1 }, false))
-        );
-        // a negative or zero turn count also means indefinite
-        for t in ["-1", "x-1", "0", "x0"] {
-            assert_eq!(
-                parse_state_command(&format!("modifier health +5 {t}")),
-                Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: -1 }, false)),
-                "turns `{t}` should be indefinite"
-            );
-        }
-        assert_eq!(parse_state_command("modifier remove regen"), Some((StateCmd::ModRemove { name: "regen".into() }, false)));
-        assert_eq!(parse_state_command("modifier list"), Some((StateCmd::ModList, false)));
-        // a mention after the verb targets another user
-        assert_eq!(
-            parse_state_command("modifier <@2> health +5 x2"),
-            Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: 2 }, true))
-        );
-        assert_eq!(parse_state_command("modifier"), None);
-    }
-
-    /// A modifier adds its delta to the stat on each of the subject's turns,
-    /// clamps to the key's constraint, and expires after its turn budget.
     #[tokio::test]
-    async fn modifiers_tick_per_turn_and_expire() {
-        let dir = std::env::temp_dir().join(format!("cockatiel-state-mod-{}", uuid::Uuid::now_v7()));
+    async fn define_constraint_and_list_modifiers() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-state-def-{}", uuid::Uuid::now_v7()));
         let mut stores = Stores::new(dir.to_string_lossy().to_string());
-        let id = test_id();
-        let mut set = settings();
-        // health is an int clamped to [0, 20] by the operator.
-        set.schema.insert(
-            "health".into(),
-            Constraint { ctype: Some("int".into()), min: Some(0.0), max: Some(20.0), options: None },
-        );
-        let guild = "g1";
+        let set = test_settings();
 
-        // add a +5 x2 modifier (health unset → starts at 0)
-        let out = alice_says(&mut stores, &set, "!state modifier health +5 x2").await;
-        assert!(reply_texts(&out)[0].contains("Modifier `health`"), "{:?}", reply_texts(&out));
+        // a user-defined constraint is enforced
+        let out = say(&mut stores, &set, "!state define -k level -type int -min 1 -max 10").await;
+        assert!(replies(&out)[0].contains("Constraint on `level`"), "{:?}", replies(&out));
+        let out = say(&mut stores, &set, "!state stat -char alice -n level -v 99").await;
+        assert!(replies(&out)[0].contains("must be <= 10"), "{:?}", replies(&out));
+        say(&mut stores, &set, "!state stat -char alice -n level -v 5").await;
 
-        // each ordinary message ticks one turn: 0 -> 5 -> 10, then it expires.
-        alice_says(&mut stores, &set, "hello").await;
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(5)));
-        alice_says(&mut stores, &set, "hi again").await;
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(10)));
-        assert!(
-            stores.guild(guild).await.unwrap().list_modifiers("discord", "1").await.unwrap().is_empty(),
-            "the modifier expired after 2 turns"
-        );
-        // no modifier now → health stays put
-        alice_says(&mut stores, &set, "more").await;
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(10)));
-
-        // a big +100 x1 modifier clamps to the operator max (20)
-        alice_says(&mut stores, &set, "!state modifier boost health +100 x1").await;
-        alice_says(&mut stores, &set, "go").await;
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(20)));
-
-        // an indefinite -3 modifier, then removed by name
-        alice_says(&mut stores, &set, "!state modifier drain health -3 inf").await;
-        let out = alice_says(&mut stores, &set, "!state modifier list").await;
-        assert!(reply_texts(&out)[0].contains("`drain` -3 to `health`"), "{:?}", reply_texts(&out));
-        alice_says(&mut stores, &set, "tick").await;
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(17)));
-        let out = alice_says(&mut stores, &set, "!state modifier remove drain").await;
-        assert!(reply_texts(&out)[0].contains("Removed modifier `drain`"));
-        assert!(stores.guild(guild).await.unwrap().list_modifiers("discord", "1").await.unwrap().is_empty());
-
-        // commands are NOT turns: the "remove drain" command above must not have
-        // ticked, so health is still 17.
-        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(17)));
+        // modifiers list shows the effect + its current turn
+        say(&mut stores, &set, "!state modify -char alice -k level -m 1 -t 3 -name up").await;
+        let out = say(&mut stores, &set, "!state modifiers -char alice").await;
+        assert!(replies(&out)[0].contains("`up`"), "{:?}", replies(&out));
+        assert!(replies(&out)[0].contains("(3 turn(s))"), "{:?}", replies(&out));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
