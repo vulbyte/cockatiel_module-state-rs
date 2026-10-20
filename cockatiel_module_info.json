@@ -1,0 +1,70 @@
+{
+  "authority": 0,
+  "autostart": true,
+  "binary": {
+    "linux": {
+      "aarch64": "target/release/cockatiel_state",
+      "arm": "target/release/cockatiel_state",
+      "x86_64": "target/release/cockatiel_state"
+    },
+    "macos": {
+      "aarch64": "target/release/cockatiel_state",
+      "arm": "target/release/cockatiel_state",
+      "x86_64": "target/release/cockatiel_state"
+    },
+    "windows": {
+      "aarch64": "target/release/cockatiel_state.exe",
+      "arm": "target/release/cockatiel_state.exe",
+      "x86_64": "target/release/cockatiel_state.exe"
+    }
+  },
+  "build_command": "cargo",
+  "build_flags": [
+    "build",
+    "--release"
+  ],
+  "capabilities": "inprocess",
+  "command_flags": [
+    "run",
+    "--release"
+  ],
+  "credentials": [
+    {
+      "key": "command_flag",
+      "label": "Command Flag",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "db_dir",
+      "label": "Database directory",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "reconnect_base_secs",
+      "label": "Reconnect base (s)",
+      "list": false,
+      "sensitive": false
+    },
+    {
+      "key": "reconnect_max_secs",
+      "label": "Reconnect max (s)",
+      "list": false,
+      "sensitive": false
+    }
+  ],
+  "description": "per-user typed key/value state — !state set/get/list/remove/define with optional type/min/max/options constraints",
+  "launch_command": "cargo",
+  "min_rank": 0,
+  "name": "state",
+  "price": 0,
+  "release": {
+    "base_url": "https://github.com/vulbyte/cockatiel_module-state-rs/releases/download",
+    "repo": "vulbyte/cockatiel_module-state-rs",
+    "tag": "v0.1.0"
+  },
+  "root_file": "./src/main.rs",
+  "terminal": false,
+  "version": "0.1.0"
+}
