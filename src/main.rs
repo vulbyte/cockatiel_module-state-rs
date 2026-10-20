@@ -274,6 +274,36 @@ impl Constraint {
     }
 }
 
+/// A named status effect: on each of the subject's turns, add `delta` to the
+/// `key` stat, decrementing `turns` (-1 = lasts forever). Removed at 0 turns.
+#[derive(Debug, Clone, PartialEq)]
+struct Modifier {
+    name: String,
+    key: String,
+    delta: f64,
+    /// Remaining turns; -1 means indefinite.
+    turns: i64,
+}
+
+/// Parse a delta like `+5`, `-3`, `5`, `+0.5` (a leading `+` is allowed).
+fn parse_delta(s: &str) -> Option<f64> {
+    let t = s.trim();
+    if t.is_empty() {
+        return None;
+    }
+    t.trim_start_matches('+').parse::<f64>().ok()
+}
+
+/// Parse a turn count: `7`, `x7`, or `inf`/`infinite`/`forever` → -1 (indefinite).
+/// A finite count must be >= 1.
+fn parse_turns(s: &str) -> Option<i64> {
+    let t = s.trim().trim_start_matches(['x', 'X']).trim();
+    if t.eq_ignore_ascii_case("inf") || t.eq_ignore_ascii_case("infinite") || t.eq_ignore_ascii_case("forever") {
+        return Some(-1);
+    }
+    t.parse::<i64>().ok().filter(|n| *n > 0)
+}
+
 /// Infer a value from raw text when no `type` is declared.
 fn infer_value(raw: &str) -> Value {
     let t = raw.trim();
@@ -316,6 +346,9 @@ enum StateCmd {
     Remove { key: String },
     Define { key: String, constraint: Constraint },
     Help,
+    ModAdd { name: String, key: String, delta: f64, turns: i64 },
+    ModRemove { name: String },
+    ModList,
 }
 
 /// Parse the args after `!state`, returning the command + whether a leading
@@ -354,9 +387,37 @@ fn parse_state_command(args: &str) -> Option<(StateCmd, bool)> {
             StateCmd::Remove { key: key.to_string() }
         }
         "define" => parse_define(rest)?,
+        "modifier" | "mod" => parse_modifier(rest)?,
         _ => return None,
     };
     Some((cmd, had_mention))
+}
+
+/// `modifier <name> <key> <delta> [x<turns>]` (add/replace) — or, if the second
+/// token is a delta, the short form `modifier <key> <delta> [x<turns>]` where
+/// the name defaults to the key. Plus `modifier remove <name>` / `modifier list`.
+fn parse_modifier(rest: &str) -> Option<StateCmd> {
+    let toks: Vec<&str> = rest.split_whitespace().collect();
+    match toks.first().map(|s| s.to_ascii_lowercase()).as_deref() {
+        None => return None,
+        Some("list") => return Some(StateCmd::ModList),
+        Some("remove") | Some("delete") | Some("rm") => {
+            return Some(StateCmd::ModRemove { name: toks.get(1)?.to_string() })
+        }
+        _ => {}
+    }
+    // Short form when the 2nd token is a delta (name = key).
+    let (name, key, delta_s, turns_s) = if toks.len() >= 2 && parse_delta(toks[1]).is_some() {
+        (toks[0].to_string(), toks[0].to_string(), toks[1], toks.get(2).copied())
+    } else {
+        (toks.first()?.to_string(), toks.get(1)?.to_string(), *toks.get(2)?, toks.get(3).copied())
+    };
+    let delta = parse_delta(delta_s)?;
+    let turns = match turns_s {
+        Some(s) => parse_turns(s)?,
+        None => -1,
+    };
+    Some(StateCmd::ModAdd { name, key, delta, turns })
 }
 
 fn parse_define(rest: &str) -> Option<StateCmd> {
@@ -504,6 +565,17 @@ impl Store {
             )
             .await
             .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS modifiers (\
+                 subject_platform TEXT NOT NULL, subject_id TEXT NOT NULL, \
+                 mname TEXT NOT NULL, skey TEXT NOT NULL, delta REAL NOT NULL, \
+                 turns INTEGER NOT NULL, created_at INTEGER NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (subject_platform, subject_id, mname))",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
     }
 
@@ -642,6 +714,66 @@ impl Store {
         while rows.next().await.map_err(|e| e.to_string())?.is_some() {}
         Ok(out)
     }
+    async fn set_modifier(&self, platform: &str, subject: &str, m: &Modifier) -> Result<(), String> {
+        self.conn
+            .execute(
+                "DELETE FROM modifiers WHERE subject_platform = ?1 AND subject_id = ?2 AND mname = ?3",
+                turso::params![vtext(platform), vtext(subject), vtext(&m.name)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO modifiers (subject_platform, subject_id, mname, skey, delta, turns, created_at) \
+                 VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                turso::params![
+                    vtext(platform),
+                    vtext(subject),
+                    vtext(&m.name),
+                    vtext(&m.key),
+                    vreal(m.delta),
+                    vint(m.turns),
+                    vint(now_ms())
+                ],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn remove_modifier(&self, platform: &str, subject: &str, name: &str) -> Result<bool, String> {
+        let had = self.list_modifiers(platform, subject).await?.iter().any(|m| m.name == name);
+        self.conn
+            .execute(
+                "DELETE FROM modifiers WHERE subject_platform = ?1 AND subject_id = ?2 AND mname = ?3",
+                turso::params![vtext(platform), vtext(subject), vtext(name)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(had)
+    }
+
+    async fn list_modifiers(&self, platform: &str, subject: &str) -> Result<Vec<Modifier>, String> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT mname, skey, delta, turns FROM modifiers \
+                 WHERE subject_platform = ?1 AND subject_id = ?2 ORDER BY mname ASC",
+                turso::params![vtext(platform), vtext(subject)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| e.to_string())? {
+            out.push(Modifier {
+                name: r.get::<String>(0).unwrap_or_default(),
+                key: r.get::<String>(1).unwrap_or_default(),
+                delta: r.get::<f64>(2).unwrap_or(0.0),
+                turns: r.get::<i64>(3).unwrap_or(-1),
+            });
+        }
+        Ok(out)
+    }
 }
 
 /// Per-guild stores, opened lazily (the read task owns them).
@@ -722,6 +854,66 @@ fn reply_container(id: &EngineIdentity, chat: &ChatMessage, msg: String) -> Cont
         module_instance_uuid7: id.instance.clone(),
         payload: Some(EnginePayload::SendToPlatforms(send)),
     }
+}
+
+/// Advance a subject's modifiers by one turn: add each delta to its stat,
+/// clamp to the key's effective constraint, and decrement/expire the counter.
+async fn tick_modifiers(store: &Store, settings: &Settings, platform: &str, subject: &str) {
+    let mods = match store.list_modifiers(platform, subject).await {
+        Ok(m) => m,
+        Err(_) => return,
+    };
+    for m in mods {
+        // Effective constraint (operator schema wins over user-defined).
+        let op = settings.schema.get(&m.key).cloned().unwrap_or_default();
+        let user = store.get_constraint(&m.key).await.unwrap_or(None).unwrap_or_default();
+        let con = op.merged_with_user(&user);
+
+        // Current value: 0 if unset; a non-numeric value cannot be modified.
+        let cur = store.get(platform, subject, &m.key).await.unwrap_or(None);
+        let (base, was_int) = match &cur {
+            Some(Value::Int(i)) => (*i as f64, true),
+            Some(Value::Float(f)) => (*f, false),
+            None => (0.0, m.delta.fract() == 0.0),
+            Some(_) => continue,
+        };
+        let mut nv = base + m.delta;
+        if let Some(min) = con.min {
+            nv = nv.max(min);
+        }
+        if let Some(max) = con.max {
+            nv = nv.min(max);
+        }
+        let value = if was_int && m.delta.fract() == 0.0 {
+            Value::Int(nv as i64)
+        } else {
+            Value::Float(nv)
+        };
+        let _ = store.set(platform, subject, &m.key, &value).await;
+
+        // Decrement the turn counter; delete at 0 (indefinite stays).
+        if m.turns > 0 {
+            let t = m.turns - 1;
+            if t == 0 {
+                let _ = store.remove_modifier(platform, subject, &m.name).await;
+            } else {
+                let _ = store
+                    .set_modifier(platform, subject, &Modifier { turns: t, ..m.clone() })
+                    .await;
+            }
+        }
+    }
+}
+
+/// Render a modifier for a reply: `` `name` +5 to `health` (7 turns) ``.
+fn describe_modifier(m: &Modifier) -> String {
+    let sign = if m.delta >= 0.0 { "+" } else { "" };
+    let dur = if m.turns < 0 {
+        "∞".to_string()
+    } else {
+        format!("{} turn(s)", m.turns)
+    };
+    format!("`{}` {sign}{} to `{}` ({dur})", m.name, m.delta, m.key)
 }
 
 // ── command handling ────────────────────────────────────────────────────────
@@ -850,11 +1042,53 @@ async fn handle_command(
                 Err(e) => push!(format!("storage error: {e}")),
             }
         }
+        StateCmd::ModList => match stores.guild(guild).await {
+            Ok(s) => match s.list_modifiers(&platform, &subject).await {
+                Ok(ms) if ms.is_empty() => push!(format!("{who} has no modifiers.")),
+                Ok(ms) => {
+                    let body = ms.iter().map(describe_modifier).collect::<Vec<_>>().join(", ");
+                    push!(format!("{who}: {body}"));
+                }
+                Err(e) => push!(format!("storage error: {e}")),
+            },
+            Err(e) => push!(format!("storage error: {e}")),
+        },
+        StateCmd::ModRemove { name } => match stores.guild(guild).await {
+            Ok(s) => match s.remove_modifier(&platform, &subject, &name).await {
+                Ok(true) => push!(format!("Removed modifier `{name}` from {who}.")),
+                Ok(false) => push!(format!("{who} has no modifier `{name}`.")),
+                Err(e) => push!(format!("storage error: {e}")),
+            },
+            Err(e) => push!(format!("storage error: {e}")),
+        },
+        StateCmd::ModAdd { name, key, delta, turns } => {
+            if name.len() > MAX_KEY_LEN || key.len() > MAX_KEY_LEN {
+                push!(format!("name/key too long (max {MAX_KEY_LEN})."));
+                return out;
+            }
+            let m = Modifier { name: name.clone(), key: key.clone(), delta, turns };
+            match stores.guild(guild).await {
+                Ok(s) => match s.set_modifier(&platform, &subject, &m).await {
+                    Ok(()) => {
+                        let dur = if turns < 0 {
+                            "indefinitely".to_string()
+                        } else {
+                            format!("for {turns} turn(s)")
+                        };
+                        let sign = if delta >= 0.0 { "+" } else { "" };
+                        push!(format!("Modifier `{name}`: {sign}{delta} to `{key}` {dur} for {who}."));
+                    }
+                    Err(e) => push!(format!("storage error: {e}")),
+                },
+                Err(e) => push!(format!("storage error: {e}")),
+            }
+        }
     }
     out
 }
 
-/// Handle one message: a `!state` command (else nothing).
+/// Handle one message: advance the author's modifiers one turn, then handle a
+/// `!state` command if the message is one.
 async fn handle_message(
     id: &EngineIdentity,
     chat: &ChatMessage,
@@ -864,25 +1098,34 @@ async fn handle_message(
     if chat.user_uuid7.is_empty() {
         return Vec::new();
     }
-    let Some(args) = parse_state_args(&chat.raw_message, &settings.command_flag, STATE_COMMAND) else {
-        return Vec::new();
-    };
-    let Some((cmd, had_mention)) = parse_state_command(&args) else {
-        return Vec::new();
-    };
     let guild = discord_guild(&chat.raw_data);
     let guild_key = if guild.is_empty() { DM_DB.to_string() } else { guild };
+    let (author_id, author_handle) = discord_author(&chat.raw_data);
 
-    // Target = the first mention (if the command used one), else the sender.
-    let target = if had_mention {
-        discord_mention(&chat.raw_data).unwrap_or_else(|| discord_author(&chat.raw_data))
-    } else {
-        discord_author(&chat.raw_data)
-    };
-    if target.0.is_empty() {
-        return Vec::new();
+    // A `!state` command does NOT advance a turn — handle it and stop.
+    if let Some(args) = parse_state_args(&chat.raw_message, &settings.command_flag, STATE_COMMAND) {
+        let Some((cmd, had_mention)) = parse_state_command(&args) else {
+            return Vec::new();
+        };
+        // Target = the first mention (if the command used one), else the sender.
+        let target = if had_mention {
+            discord_mention(&chat.raw_data).unwrap_or((author_id, author_handle))
+        } else {
+            (author_id, author_handle)
+        };
+        if target.0.is_empty() {
+            return Vec::new();
+        }
+        return handle_command(id, chat, stores, settings, &guild_key, target, cmd).await;
     }
-    handle_command(id, chat, stores, settings, &guild_key, target, cmd).await
+
+    // Otherwise this ordinary message is ONE TURN: advance the author's modifiers.
+    if !author_id.is_empty() {
+        if let Ok(store) = stores.guild(&guild_key).await {
+            tick_modifiers(store, settings, &chat.platform, &author_id).await;
+        }
+    }
+    Vec::new()
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
@@ -1265,6 +1508,95 @@ mod tests {
         assert!(reply_texts(&out)[0].contains("Removed `colour`"));
         let out = alice_says(&mut stores, &set, "!state get colour").await;
         assert!(reply_texts(&out)[0].contains("no property `colour`"));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[test]
+    fn parses_modifiers() {
+        // short form: name defaults to the key
+        assert_eq!(
+            parse_state_command("modifier health +5 x7"),
+            Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: 7 }, false))
+        );
+        // long form: explicit name
+        assert_eq!(
+            parse_state_command("modifier regen health +5 x7"),
+            Some((StateCmd::ModAdd { name: "regen".into(), key: "health".into(), delta: 5.0, turns: 7 }, false))
+        );
+        // negative, float, indefinite
+        assert_eq!(
+            parse_state_command("modifier poison health -3"),
+            Some((StateCmd::ModAdd { name: "poison".into(), key: "health".into(), delta: -3.0, turns: -1 }, false))
+        );
+        assert_eq!(
+            parse_state_command("modifier speed +0.5 x3"),
+            Some((StateCmd::ModAdd { name: "speed".into(), key: "speed".into(), delta: 0.5, turns: 3 }, false))
+        );
+        assert_eq!(
+            parse_state_command("modifier health +5 inf"),
+            Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: -1 }, false))
+        );
+        assert_eq!(parse_state_command("modifier remove regen"), Some((StateCmd::ModRemove { name: "regen".into() }, false)));
+        assert_eq!(parse_state_command("modifier list"), Some((StateCmd::ModList, false)));
+        // a mention after the verb targets another user
+        assert_eq!(
+            parse_state_command("modifier <@2> health +5 x2"),
+            Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: 2 }, true))
+        );
+        assert_eq!(parse_state_command("modifier"), None);
+    }
+
+    /// A modifier adds its delta to the stat on each of the subject's turns,
+    /// clamps to the key's constraint, and expires after its turn budget.
+    #[tokio::test]
+    async fn modifiers_tick_per_turn_and_expire() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-state-mod-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let id = test_id();
+        let mut set = settings();
+        // health is an int clamped to [0, 20] by the operator.
+        set.schema.insert(
+            "health".into(),
+            Constraint { ctype: Some("int".into()), min: Some(0.0), max: Some(20.0), options: None },
+        );
+        let guild = "g1";
+
+        // add a +5 x2 modifier (health unset → starts at 0)
+        let out = alice_says(&mut stores, &set, "!state modifier health +5 x2").await;
+        assert!(reply_texts(&out)[0].contains("Modifier `health`"), "{:?}", reply_texts(&out));
+
+        // each ordinary message ticks one turn: 0 -> 5 -> 10, then it expires.
+        alice_says(&mut stores, &set, "hello").await;
+        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(5)));
+        alice_says(&mut stores, &set, "hi again").await;
+        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(10)));
+        assert!(
+            stores.guild(guild).await.unwrap().list_modifiers("discord", "1").await.unwrap().is_empty(),
+            "the modifier expired after 2 turns"
+        );
+        // no modifier now → health stays put
+        alice_says(&mut stores, &set, "more").await;
+        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(10)));
+
+        // a big +100 x1 modifier clamps to the operator max (20)
+        alice_says(&mut stores, &set, "!state modifier boost health +100 x1").await;
+        alice_says(&mut stores, &set, "go").await;
+        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(20)));
+
+        // an indefinite -3 modifier, then removed by name
+        alice_says(&mut stores, &set, "!state modifier drain health -3 inf").await;
+        let out = alice_says(&mut stores, &set, "!state modifier list").await;
+        assert!(reply_texts(&out)[0].contains("`drain` -3 to `health`"), "{:?}", reply_texts(&out));
+        alice_says(&mut stores, &set, "tick").await;
+        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(17)));
+        let out = alice_says(&mut stores, &set, "!state modifier remove drain").await;
+        assert!(reply_texts(&out)[0].contains("Removed modifier `drain`"));
+        assert!(stores.guild(guild).await.unwrap().list_modifiers("discord", "1").await.unwrap().is_empty());
+
+        // commands are NOT turns: the "remove drain" command above must not have
+        // ticked, so health is still 17.
+        assert_eq!(stores.guild(guild).await.unwrap().get("discord", "1", "health").await.unwrap(), Some(Value::Int(17)));
 
         let _ = std::fs::remove_dir_all(&dir);
     }

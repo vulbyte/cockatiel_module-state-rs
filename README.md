@@ -13,7 +13,30 @@ attached to a chat user, with optional **constraints**.
 | `!state list [@user]` | list keys (and values) |
 | `!state remove [@user] <key>` | delete a property |
 | `!state define <key> [type=…] [min=…] [max=…] [options=a\|b\|c]` | constrain a key |
+| `!state modifier <name> <key> <delta> [x<turns>]` | add a named per-turn modifier |
+| `!state modifier remove <name>` | remove a modifier by name |
+| `!state modifier list` | list modifiers |
 | `!state help` | usage |
+
+### Modifiers (status effects)
+
+A modifier adjusts a stat by `delta` **every turn** (a turn = one ordinary
+message from the affected user; `!state` commands don't count). It lasts
+`x<turns>` turns, or **indefinitely** (`inf`, or omit the turns). A modifier has
+a **name** so it can be removed/replaced easily.
+
+```
+!state modifier health +5 x7        # +5 health each turn, for 7 turns
+!state modifier regen health +5 x7  # named "regen" (long form)
+!state modifier poison health -3    # indefinite -3
+!state modifier speed +0.5 x3
+!state modifier @user health +5 x2  # apply to someone else
+!state modifier remove regen
+!state modifier list
+```
+
+Values are clamped to the key's constraint (so `health` with `min=0 max=20`
+never leaves `[0, 20]`).
 
 ## Values & constraints
 
