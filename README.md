@@ -19,6 +19,10 @@ read or edit any character's stats.**
 | `!state remove -char <c> -c <category>` | remove a whole category |
 | `!state modifiers -char <c>` | list active modifiers |
 | `!state define -k <name> [-type …] [-min …] [-max …] [-options a\|b\|c]` | constrain a key |
+| `!state trigger -char <c> -k <name> [-op le\|ge\|lt\|gt\|eq\|ne] -v <n> -msg <text>` | announce when a stat crosses a bound |
+| `!state trigger -char <c> -k <name> -clear` | remove a trigger |
+| `!state roll -char <c> [-k <stat>] [-d <die>] [-mod <n>] [-vs <target>]` | roll a check |
+| `!state history -char <c> [-k <name>] [-n <limit>]` | recent changes (who/what/when) |
 | `!state help` | usage |
 
 `-c` (stat) is the **category**; `-k` (modify/remove/define) is the stat **key**;
@@ -53,6 +57,21 @@ The turn budget `-t <n>` defaults to (and is forced to) **indefinite** when
 omitted, `inf`, or non-positive. `-name` names the modifier (defaults to the
 key); re-adding a name replaces it. The result is clamped to the key's
 constraint, and a non-numeric stat is skipped.
+
+Formulas also support **dice and functions**: `d20` / `d6` (a die roll), and
+`rand(a,b)`, `min(a,b)`, `max(a,b)`, `floor(x)`, `ceil(x)`, `round(x)`, `abs(x)`,
+`d(n)`. So `-m "d6 + 1"` is a random per-turn effect.
+
+## Triggers, rolls & history
+
+- **Triggers** announce a message when a stat **crosses** a bound (the old value
+  didn't satisfy it, the new one does) — e.g.
+  `!state trigger -char alice -k hp -op le -v 0 -msg "alice has fallen!"`. They
+  fire from both direct edits and modifier ticks.
+- **Rolls/checks**: `!state roll -char alice -k hp -d 20 -vs 15` rolls `d20` plus
+  the stat (and/or `-mod`), reporting SUCCESS/FAILURE against the target.
+- **History**: every stat change is logged (key, old → new, who, when) —
+  `!state history -char alice [-k hp]`.
 
 ## Storage
 

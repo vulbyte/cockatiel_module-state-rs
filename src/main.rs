@@ -59,6 +59,44 @@ const MAX_NAME_LEN: usize = 64;
 const MAX_VALUE_LEN: usize = 1024;
 const MAX_STATS_PER_CHAR: usize = 200;
 
+// ── randomness (dependency-free xorshift) ───────────────────────────────────
+
+use std::sync::atomic::{AtomicU64, Ordering};
+static RNG_STATE: AtomicU64 = AtomicU64::new(0);
+
+/// A fast xorshift64 PRNG. Seeded lazily from the clock; good enough for dice.
+fn next_rand() -> u64 {
+    let mut x = RNG_STATE.load(Ordering::Relaxed);
+    if x == 0 {
+        x = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos() as u64)
+            .unwrap_or(0x9e37_79b9_7f4a_7c15)
+            | 1;
+    }
+    x ^= x << 13;
+    x ^= x >> 7;
+    x ^= x << 17;
+    RNG_STATE.store(x, Ordering::Relaxed);
+    x
+}
+
+/// Roll one die with `sides` faces → 1..=sides (0 if `sides` is 0).
+fn roll_die(sides: u32) -> i64 {
+    if sides == 0 {
+        0
+    } else {
+        (next_rand() % sides as u64) as i64 + 1
+    }
+}
+
+/// A random integer in `[lo, hi]` (inclusive); swapped if reversed.
+fn roll_range(lo: i64, hi: i64) -> i64 {
+    let (lo, hi) = if lo <= hi { (lo, hi) } else { (hi, lo) };
+    let span = (hi - lo) as u64 + 1;
+    lo + (next_rand() % span) as i64
+}
+
 // ── config ────────────────────────────────────────────────────────────────
 
 #[derive(Debug, Clone)]
@@ -323,6 +361,7 @@ enum Tok {
     Op(char),
     LP,
     RP,
+    Comma,
 }
 
 fn tokenize(expr: &str) -> Result<Vec<Tok>, String> {
@@ -351,6 +390,7 @@ fn tokenize(expr: &str) -> Result<Vec<Tok>, String> {
                 '+' | '-' | '*' | '/' => Tok::Op(c),
                 '(' => Tok::LP,
                 ')' => Tok::RP,
+                ',' => Tok::Comma,
                 _ => return Err(format!("unexpected `{c}`")),
             });
             i += 1;
@@ -404,6 +444,31 @@ impl Parser<'_> {
             }
             Some(Tok::Var(name)) => {
                 self.pos += 1;
+                // A function call: name(args…).
+                if matches!(self.peek(), Some(Tok::LP)) {
+                    self.pos += 1;
+                    let mut args = Vec::new();
+                    if !matches!(self.peek(), Some(Tok::RP)) {
+                        loop {
+                            args.push(self.expr()?);
+                            match self.peek() {
+                                Some(Tok::Comma) => self.pos += 1,
+                                _ => break,
+                            }
+                        }
+                    }
+                    if !matches!(self.peek(), Some(Tok::RP)) {
+                        return Err("missing `)`".to_string());
+                    }
+                    self.pos += 1;
+                    return call_fn(&name, &args);
+                }
+                // A die literal: `d20` / `D6` → 1..=n.
+                if let Some(rest) = name.strip_prefix(['d', 'D']) {
+                    if let Ok(sides) = rest.parse::<u32>() {
+                        return Ok(roll_die(sides) as f64);
+                    }
+                }
                 self.vars.get(&name.to_ascii_lowercase()).copied().ok_or_else(|| format!("unknown name `{name}`"))
             }
             Some(Tok::Op('-')) => {
@@ -427,6 +492,21 @@ impl Parser<'_> {
             }
             other => Err(format!("unexpected {other:?}")),
         }
+    }
+}
+
+/// Built-in formula functions (dice/random + small math).
+fn call_fn(name: &str, args: &[f64]) -> Result<f64, String> {
+    match (name.to_ascii_lowercase().as_str(), args) {
+        ("rand", [a, b]) | ("random", [a, b]) => Ok(roll_range(a.ceil() as i64, b.floor() as i64) as f64),
+        ("d", [n]) => Ok(roll_die(n.max(0.0) as u32) as f64),
+        ("min", [a, b]) => Ok(a.min(*b)),
+        ("max", [a, b]) => Ok(a.max(*b)),
+        ("floor", [a]) => Ok(a.floor()),
+        ("ceil", [a]) => Ok(a.ceil()),
+        ("round", [a]) => Ok(a.round()),
+        ("abs", [a]) => Ok(a.abs()),
+        _ => Err(format!("unknown function `{name}` (rand/min/max/floor/ceil/round/abs/d)")),
     }
 }
 
@@ -469,6 +549,42 @@ fn describe_modifier(m: &Modifier) -> String {
     format!("`{}` {}(={}) to `{}` ({dur})", m.name, m.expr, m.ticked + 1, m.key)
 }
 
+/// A threshold trigger: when a stat crosses `val` (direction `op`), announce
+/// `message`.
+#[derive(Debug, Clone, PartialEq)]
+struct Trigger {
+    op: String,
+    val: f64,
+    message: String,
+}
+
+impl Trigger {
+    /// Whether `v` satisfies the condition (None = the stat is unset → no).
+    fn satisfied(&self, v: Option<f64>) -> bool {
+        let Some(n) = v else { return false };
+        match self.op.as_str() {
+            "le" | "<=" => n <= self.val,
+            "ge" | ">=" => n >= self.val,
+            "lt" | "<" => n < self.val,
+            "gt" | ">" => n > self.val,
+            "eq" | "==" | "=" => (n - self.val).abs() < 1e-9,
+            "ne" | "!=" => (n - self.val).abs() >= 1e-9,
+            _ => false,
+        }
+    }
+}
+
+/// One recorded stat change (the change log).
+#[derive(Debug, Clone, PartialEq)]
+struct Change {
+    key: String,
+    old: Option<String>,
+    new: String,
+    actor: String,
+    source: String,
+    at: i64,
+}
+
 // ── flags ───────────────────────────────────────────────────────────────────
 
 /// Parse `-flag value…` pairs. A token `-<letter>…` starts a flag; everything
@@ -509,6 +625,10 @@ enum StateCmd {
     Remove { character: String, key: Option<String>, category: Option<String> },
     Define { key: String, constraint: Constraint },
     Modifiers { character: String },
+    Trigger { character: String, key: String, op: String, val: f64, message: String },
+    TriggerClear { character: String, key: String },
+    Roll { character: String, key: Option<String>, die: u32, modifier: Option<f64>, vs: Option<f64> },
+    History { character: String, key: Option<String>, limit: i64 },
     Help,
 }
 
@@ -554,6 +674,32 @@ fn parse_state_command(args: &str) -> Option<StateCmd> {
             },
         }),
         "modifiers" | "mods" => Some(StateCmd::Modifiers { character: get("char")? }),
+        "trigger" => {
+            let character = get("char")?;
+            let key = get("k")?;
+            if f.contains_key("clear") {
+                return Some(StateCmd::TriggerClear { character, key });
+            }
+            Some(StateCmd::Trigger {
+                character,
+                key,
+                op: get("op").unwrap_or_else(|| "le".to_string()),
+                val: get("v")?.parse::<f64>().ok()?,
+                message: get("msg")?.trim_matches('"').to_string(),
+            })
+        }
+        "roll" => Some(StateCmd::Roll {
+            character: get("char")?,
+            key: get("k"),
+            die: get("d").and_then(|s| s.parse::<u32>().ok()).unwrap_or(20),
+            modifier: get("mod").and_then(|s| s.parse::<f64>().ok()),
+            vs: get("vs").and_then(|s| s.parse::<f64>().ok()),
+        }),
+        "history" | "log" => Some(StateCmd::History {
+            character: get("char")?,
+            key: get("k"),
+            limit: get("n").and_then(|s| s.parse::<i64>().ok()).unwrap_or(10).clamp(1, 50),
+        }),
         _ => None,
     }
 }
@@ -587,6 +733,14 @@ fn discord_guild(raw_data: &[u8]) -> String {
     serde_json::from_slice::<serde_json::Value>(raw_data)
         .ok()
         .and_then(|v| v.get("guild_id").and_then(|x| x.as_str()).map(|s| s.to_string()))
+        .unwrap_or_default()
+}
+
+/// The message author's handle (for the change log's `actor`).
+fn discord_actor(raw_data: &[u8]) -> String {
+    serde_json::from_slice::<serde_json::Value>(raw_data)
+        .ok()
+        .and_then(|v| v.get("author").and_then(|a| a.get("username")).and_then(|x| x.as_str()).map(|s| s.to_string()))
         .unwrap_or_default()
 }
 
@@ -655,7 +809,112 @@ impl Store {
             )
             .await
             .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS triggers (\
+                 character TEXT NOT NULL, skey TEXT NOT NULL, op TEXT NOT NULL, \
+                 val REAL NOT NULL, message TEXT NOT NULL, created_at INTEGER NOT NULL DEFAULT 0, \
+                 PRIMARY KEY (character, skey))",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS changelog (\
+                 id INTEGER PRIMARY KEY, character TEXT NOT NULL, skey TEXT NOT NULL, \
+                 oldv TEXT, newv TEXT, actor TEXT, source TEXT, at INTEGER NOT NULL DEFAULT 0)",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    async fn set_trigger(&self, character: &str, key: &str, t: &Trigger) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM triggers WHERE character = ?1 AND skey = ?2", turso::params![vtext(character), vtext(key)])
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO triggers (character, skey, op, val, message, created_at) VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
+                turso::params![vtext(character), vtext(key), vtext(&t.op), vreal(t.val), vtext(&t.message), vint(now_ms())],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn get_trigger(&self, character: &str, key: &str) -> Result<Option<Trigger>, String> {
+        let mut rows = self
+            .conn
+            .query(
+                "SELECT op, val, message FROM triggers WHERE character = ?1 AND skey = ?2",
+                turso::params![vtext(character), vtext(key)],
+            )
+            .await
+            .map_err(|e| e.to_string())?;
+        let out = rows.next().await.map_err(|e| e.to_string())?.map(|r| Trigger {
+            op: r.get::<String>(0).unwrap_or_default(),
+            val: r.get::<f64>(1).unwrap_or(0.0),
+            message: r.get::<String>(2).unwrap_or_default(),
+        });
+        while rows.next().await.map_err(|e| e.to_string())?.is_some() {}
+        Ok(out)
+    }
+
+    async fn remove_trigger(&self, character: &str, key: &str) -> Result<bool, String> {
+        let had = self.get_trigger(character, key).await?.is_some();
+        self.conn
+            .execute("DELETE FROM triggers WHERE character = ?1 AND skey = ?2", turso::params![vtext(character), vtext(key)])
+            .await
+            .map_err(|e| e.to_string())?;
+        Ok(had)
+    }
+
+    async fn log_change(&self, character: &str, key: &str, old: Option<&Value>, new: &Value, actor: &str, source: &str) {
+        let _ = self
+            .conn
+            .execute(
+                "INSERT INTO changelog (character, skey, oldv, newv, actor, source, at) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)",
+                turso::params![
+                    vtext(character),
+                    vtext(key),
+                    old.map(|v| vtext(&v.display())).unwrap_or_else(vnull),
+                    vtext(&new.display()),
+                    vtext(actor),
+                    vtext(source),
+                    vint(now_ms())
+                ],
+            )
+            .await;
+    }
+
+    async fn history(&self, character: &str, key: Option<&str>, limit: i64) -> Result<Vec<Change>, String> {
+        let (sql, params): (&str, Vec<turso::Value>) = match key {
+            Some(k) => (
+                "SELECT skey, oldv, newv, actor, source, at FROM changelog WHERE character = ?1 AND skey = ?2 ORDER BY id DESC LIMIT ?3",
+                vec![vtext(character), vtext(k), vint(limit)],
+            ),
+            None => (
+                "SELECT skey, oldv, newv, actor, source, at FROM changelog WHERE character = ?1 ORDER BY id DESC LIMIT ?2",
+                vec![vtext(character), vint(limit)],
+            ),
+        };
+        let mut rows = self.conn.query(sql, params).await.map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| e.to_string())? {
+            out.push(Change {
+                key: r.get::<String>(0).unwrap_or_default(),
+                old: r.get::<Option<String>>(1).ok().flatten(),
+                new: r.get::<String>(2).unwrap_or_default(),
+                actor: r.get::<String>(3).unwrap_or_default(),
+                source: r.get::<String>(4).unwrap_or_default(),
+                at: r.get::<i64>(5).unwrap_or(0),
+            });
+        }
+        Ok(out)
     }
 
     async fn count_stats(&self, character: &str) -> Result<usize, String> {
@@ -905,10 +1164,11 @@ impl Stores {
 /// Advance every modifier in the store by one turn: evaluate its formula
 /// (`t` = this turn number; other names = the character's current stat values),
 /// add the result to the stat, clamp to the constraint, and decrement/expire.
-async fn tick_modifiers(store: &Store, settings: &Settings) {
+async fn tick_modifiers(store: &Store, settings: &Settings) -> Vec<String> {
+    let mut fired = Vec::new();
     let mods = match store.all_modifiers().await {
         Ok(m) => m,
-        Err(_) => return,
+        Err(_) => return fired,
     };
     for (character, m) in mods {
         // Build the variable context: t + the character's numeric stats.
@@ -951,8 +1211,7 @@ async fn tick_modifiers(store: &Store, settings: &Settings) {
             nv = nv.min(max);
         }
         let value = if was_int && delta.fract() == 0.0 { Value::Int(nv as i64) } else { Value::Float(nv) };
-        let category = cur.map(|s| s.category).unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
-        let _ = store.stat_set(&character, &Stat { category, name: m.key.clone(), value }).await;
+        fired.extend(write_stat(store, &character, &m.key, value, "", "modifier", None).await);
 
         // Decrement / expire.
         let next = Modifier { ticked: m.ticked + 1, ..m.clone() };
@@ -967,6 +1226,7 @@ async fn tick_modifiers(store: &Store, settings: &Settings) {
             let _ = store.set_modifier(&character, &next).await;
         }
     }
+    fired
 }
 
 // ── engine plumbing ─────────────────────────────────────────────────────────
@@ -1031,6 +1291,36 @@ async fn effective_constraint(store: &Store, settings: &Settings, key: &str) -> 
     op.merged_with_user(&user)
 }
 
+/// Write a stat value, record it in the change log, and fire any threshold
+/// trigger the write CROSSES (the old value did not satisfy it, the new does).
+/// Returns the trigger messages to announce.
+async fn write_stat(
+    store: &Store,
+    character: &str,
+    key: &str,
+    new: Value,
+    actor: &str,
+    source: &str,
+    category: Option<&str>,
+) -> Vec<String> {
+    let old = store.stat_get(character, key).await.unwrap_or(None);
+    let category = category
+        .map(|s| s.to_string())
+        .or_else(|| old.as_ref().map(|s| s.category.clone()))
+        .unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
+    let _ = store
+        .stat_set(character, &Stat { category, name: key.to_string(), value: new.clone() })
+        .await;
+    store.log_change(character, key, old.as_ref().map(|s| &s.value), &new, actor, source).await;
+    if let Some(t) = store.get_trigger(character, key).await.unwrap_or(None) {
+        let was = old.as_ref().and_then(|s| s.value.as_f64());
+        if t.satisfied(new.as_f64()) && !t.satisfied(was) {
+            return vec![t.message];
+        }
+    }
+    Vec::new()
+}
+
 async fn handle_command(
     id: &EngineIdentity,
     chat: &ChatMessage,
@@ -1052,6 +1342,7 @@ async fn handle_command(
             return out;
         }
     };
+    let actor = discord_actor(&chat.raw_data);
 
     match cmd {
         StateCmd::Help => {
@@ -1094,9 +1385,9 @@ async fn handle_command(
                 push!(format!("`{character}` already has {MAX_STATS_PER_CHAR} stats (the cap)."));
                 return out;
             }
-            match store.stat_set(&character, &Stat { category: category.clone(), name: name.clone(), value: v.clone() }).await {
-                Ok(()) => push!(format!("`{character}` [{category}] `{name}` = {}.", v.display())),
-                Err(e) => push!(format!("storage error: {e}")),
+            push!(format!("`{character}` [{category}] `{name}` = {}.", v.display()));
+            for m in write_stat(store, &character, &name, v, &actor, "stat", Some(&category)).await {
+                push!(m);
             }
         }
         StateCmd::Modify { character, key, value, expr, turns, mname } => {
@@ -1118,10 +1409,9 @@ async fn handle_command(
                         push!(format!("`{key}`: {e}."));
                         return out;
                     }
-                    let category = store.stat_get(&character, &key).await.unwrap_or(None).map(|s| s.category).unwrap_or_else(|| DEFAULT_CATEGORY.to_string());
-                    match store.stat_set(&character, &Stat { category, name: key.clone(), value: val.clone() }).await {
-                        Ok(()) => push!(format!("`{character}` `{key}` = {}.", val.display())),
-                        Err(e) => push!(format!("storage error: {e}")),
+                    push!(format!("`{character}` `{key}` = {}.", val.display()));
+                    for m in write_stat(store, &character, &key, val, &actor, "modify", None).await {
+                        push!(m);
                     }
                 }
                 // Add/replace a formula modifier.
@@ -1201,6 +1491,53 @@ async fn handle_command(
             )),
             Err(e) => push!(format!("storage error: {e}")),
         },
+        StateCmd::Trigger { character, key, op, val, message } => {
+            let t = Trigger { op: op.clone(), val, message: message.clone() };
+            match store.set_trigger(&character, &key, &t).await {
+                Ok(()) => push!(format!("Trigger on `{character}` `{key}`: when {op} {val} → \"{message}\".")),
+                Err(e) => push!(format!("storage error: {e}")),
+            }
+        }
+        StateCmd::TriggerClear { character, key } => match store.remove_trigger(&character, &key).await {
+            Ok(true) => push!(format!("Removed trigger on `{character}` `{key}`.")),
+            Ok(false) => push!(format!("`{character}` has no trigger on `{key}`.")),
+            Err(e) => push!(format!("storage error: {e}")),
+        },
+        StateCmd::Roll { character, key, die, modifier, vs } => {
+            let stat_mod = match &key {
+                Some(k) => store.stat_get(&character, k).await.unwrap_or(None).and_then(|s| s.value.as_f64()),
+                None => None,
+            };
+            let bonus = stat_mod.unwrap_or(0.0) + modifier.unwrap_or(0.0);
+            let roll = roll_die(die);
+            let total = roll as f64 + bonus;
+            let label = key.map(|k| format!(" + `{k}`")).unwrap_or_default();
+            match vs {
+                Some(target) => {
+                    let ok = total >= target;
+                    push!(format!(
+                        "🎲 `{character}` rolled d{die}: {roll}{label} ({bonus:+.0}) = {total:.0} vs {target:.0} → {}",
+                        if ok { "SUCCESS" } else { "FAILURE" }
+                    ));
+                }
+                None => push!(format!("🎲 `{character}` rolled d{die}: {roll}{label} ({bonus:+.0}) = {total:.0}")),
+            }
+        }
+        StateCmd::History { character, key, limit } => match store.history(&character, key.as_deref(), limit).await {
+            Ok(h) if h.is_empty() => push!(format!("`{character}` has no history.")),
+            Ok(h) => {
+                let body = h
+                    .iter()
+                    .map(|c| {
+                        let by = if c.actor.is_empty() { c.source.clone() } else { c.actor.clone() };
+                        format!("`{}`: {} → {} ({by})", c.key, c.old.clone().unwrap_or_else(|| "∅".into()), c.new)
+                    })
+                    .collect::<Vec<_>>()
+                    .join(" · ");
+                push!(format!("`{character}` (last {}): {body}", h.len()));
+            }
+            Err(e) => push!(format!("storage error: {e}")),
+        },
     }
     out
 }
@@ -1225,10 +1562,13 @@ async fn handle_message(
     }
 
     // Otherwise this ordinary message is ONE TURN: advance every modifier.
+    let mut out = Vec::new();
     if let Ok(store) = stores.guild(&guild_key).await {
-        tick_modifiers(store, settings).await;
+        for m in tick_modifiers(store, settings).await {
+            out.push(reply_container(id, chat, m));
+        }
     }
-    Vec::new()
+    out
 }
 
 // ── main ────────────────────────────────────────────────────────────────────
@@ -1570,6 +1910,56 @@ mod tests {
         let out = say(&mut stores, &set, "!state modifiers -char alice").await;
         assert!(replies(&out)[0].contains("`up`"), "{:?}", replies(&out));
         assert!(replies(&out)[0].contains("(3 turn(s))"), "{:?}", replies(&out));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn triggers_rolls_and_history() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-state-trh-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let set = test_settings();
+
+        say(&mut stores, &set, "!state stat -char alice -n hp -v 10").await;
+        let out = say(&mut stores, &set, "!state trigger -char alice -k hp -op le -v 0 -msg fallen").await;
+        assert!(replies(&out)[0].contains("Trigger on `alice` `hp`"), "{:?}", replies(&out));
+
+        // still above the threshold → no announcement
+        let out = say(&mut stores, &set, "!state modify -char alice -k hp -v 5").await;
+        assert!(replies(&out).iter().all(|m| !m.contains("fallen")), "{:?}", replies(&out));
+
+        // crossing into `<= 0` → fires
+        let out = say(&mut stores, &set, "!state modify -char alice -k hp -v 0").await;
+        assert!(replies(&out).iter().any(|m| m.contains("fallen")), "{:?}", replies(&out));
+
+        // already satisfying → no re-fire (only CROSSINGS announce)
+        let out = say(&mut stores, &set, "!state modify -char alice -k hp -v 0").await;
+        assert!(replies(&out).iter().all(|m| !m.contains("fallen")), "{:?}", replies(&out));
+
+        // a trigger fired from a MODIFIER tick: hp 5 -> 0 crosses
+        say(&mut stores, &set, "!state modify -char alice -k hp -v 5").await;
+        say(&mut stores, &set, "!state modify -char alice -k hp -m -5 -t 1").await;
+        let out = say(&mut stores, &set, "an ordinary message").await;
+        assert!(replies(&out).iter().any(|m| m.contains("fallen")), "{:?}", replies(&out));
+
+        // randomness in a formula: `d6` and `rand(1,6)` both land in range
+        for _ in 0..50 {
+            let r = eval_formula("d6", &HashMap::new()).unwrap();
+            assert!((1.0..=6.0).contains(&r), "d6 = {r}");
+            let r = eval_formula("rand(1,6)", &HashMap::new()).unwrap();
+            assert!((1.0..=6.0).contains(&r), "rand = {r}");
+        }
+
+        // a roll/check
+        let out = say(&mut stores, &set, "!state roll -char alice -k hp -d 20 -vs 5").await;
+        assert!(replies(&out)[0].contains("rolled d20"), "{:?}", replies(&out));
+        assert!(replies(&out)[0].contains("SUCCESS") || replies(&out)[0].contains("FAILURE"));
+
+        // change log records who changed what
+        let out = say(&mut stores, &set, "!state history -char alice -k hp").await;
+        assert!(replies(&out)[0].contains("`hp`"), "{:?}", replies(&out));
+        assert!(replies(&out)[0].contains("(alice)"), "actor recorded: {:?}", replies(&out));
+        assert!(replies(&out)[0].contains("(modifier)"), "tick source recorded: {:?}", replies(&out));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
