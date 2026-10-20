@@ -23,6 +23,9 @@ read or edit any character's stats.**
 | `!state trigger -char <c> -k <name> -clear` | remove a trigger |
 | `!state roll -char <c> [-k <stat>] [-d <die>] [-mod <n>] [-vs <target>]` | roll a check |
 | `!state history -char <c> [-k <name>] [-n <limit>]` | recent changes (who/what/when) |
+| `!state clone -char <src> -to <dst>` | duplicate a character's sheet |
+| `!state join -char <c>` / `!state leave -char <c>` | enter / leave the adventure |
+| `!state roster` | list characters (frozen ones marked) |
 | `!state help` | usage |
 
 `-c` (stat) is the **category**; `-k` (modify/remove/define) is the stat **key**;
@@ -72,6 +75,17 @@ Formulas also support **dice and functions**: `d20` / `d6` (a die roll), and
   the stat (and/or `-mod`), reporting SUCCESS/FAILURE against the target.
 - **History**: every stat change is logged (key, old → new, who, when) —
   `!state history -char alice [-k hp]`.
+
+## Clone & the adventure
+
+- **Clone** copies a character's whole sheet (stats + categories) onto another
+  character, so you can spin up a copy to experiment with without risking the
+  original: `!state clone -char alice -to alice_test`.
+- **Adventure membership.** A turn is one ordinary message, and every *active*
+  character's modifiers tick on it. `!state leave -char alice` **freezes** a
+  character (its modifiers stop ticking) while the RP keeps going for everyone
+  else; `!state join -char alice` brings it back. A character is active by
+  default; `!state roster` lists everyone and marks the frozen ones.
 
 ## Storage
 

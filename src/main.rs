@@ -629,6 +629,10 @@ enum StateCmd {
     TriggerClear { character: String, key: String },
     Roll { character: String, key: Option<String>, die: u32, modifier: Option<f64>, vs: Option<f64> },
     History { character: String, key: Option<String>, limit: i64 },
+    Clone { from: String, to: String },
+    Join { character: String },
+    Leave { character: String },
+    Roster,
     Help,
 }
 
@@ -700,6 +704,10 @@ fn parse_state_command(args: &str) -> Option<StateCmd> {
             key: get("k"),
             limit: get("n").and_then(|s| s.parse::<i64>().ok()).unwrap_or(10).clamp(1, 50),
         }),
+        "clone" | "copy" => Some(StateCmd::Clone { from: get("char")?, to: get("to")? }),
+        "join" => Some(StateCmd::Join { character: get("char")? }),
+        "leave" => Some(StateCmd::Leave { character: get("char")? }),
+        "roster" | "party" => Some(StateCmd::Roster),
         _ => None,
     }
 }
@@ -828,7 +836,65 @@ impl Store {
             )
             .await
             .map_err(|e| e.to_string())?;
+        // Adventure membership. A character with NO row is ACTIVE (default);
+        // `leave` writes an active=0 row so its modifiers stop ticking.
+        self.conn
+            .execute(
+                "CREATE TABLE IF NOT EXISTS characters (\
+                 character TEXT PRIMARY KEY, active INTEGER NOT NULL DEFAULT 1, \
+                 updated_at INTEGER NOT NULL DEFAULT 0)",
+                (),
+            )
+            .await
+            .map_err(|e| e.to_string())?;
         Ok(())
+    }
+
+    /// Mark a character in/out of the adventure (DELETE + INSERT: no upsert in
+    /// turso 0.1.0).
+    async fn set_active(&self, character: &str, active: bool) -> Result<(), String> {
+        self.conn
+            .execute("DELETE FROM characters WHERE character = ?1", turso::params![vtext(character)])
+            .await
+            .map_err(|e| e.to_string())?;
+        self.conn
+            .execute(
+                "INSERT INTO characters (character, active, updated_at) VALUES (?1, ?2, ?3)",
+                turso::params![vtext(character), vint(active as i64), vint(now_ms())],
+            )
+            .await
+            .map(|_| ())
+            .map_err(|e| e.to_string())
+    }
+
+    async fn inactive_characters(&self) -> Result<Vec<String>, String> {
+        let mut rows = self
+            .conn
+            .query("SELECT character FROM characters WHERE active = 0", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| e.to_string())? {
+            if let Ok(c) = r.get::<String>(0) {
+                out.push(c);
+            }
+        }
+        Ok(out)
+    }
+
+    async fn distinct_characters(&self) -> Result<Vec<String>, String> {
+        let mut rows = self
+            .conn
+            .query("SELECT DISTINCT character FROM stats ORDER BY character ASC", ())
+            .await
+            .map_err(|e| e.to_string())?;
+        let mut out = Vec::new();
+        while let Some(r) = rows.next().await.map_err(|e| e.to_string())? {
+            if let Ok(c) = r.get::<String>(0) {
+                out.push(c);
+            }
+        }
+        Ok(out)
     }
 
     async fn set_trigger(&self, character: &str, key: &str, t: &Trigger) -> Result<(), String> {
@@ -1170,7 +1236,12 @@ async fn tick_modifiers(store: &Store, settings: &Settings) -> Vec<String> {
         Ok(m) => m,
         Err(_) => return fired,
     };
+    // Characters that LEFT the adventure are frozen: their modifiers don't tick.
+    let frozen: std::collections::HashSet<String> = store.inactive_characters().await.unwrap_or_default().into_iter().collect();
     for (character, m) in mods {
+        if frozen.contains(&character) {
+            continue;
+        }
         // Build the variable context: t + the character's numeric stats.
         let mut vars: HashMap<String, f64> = HashMap::new();
         vars.insert("t".to_string(), (m.ticked + 1) as f64);
@@ -1348,11 +1419,22 @@ async fn handle_command(
         StateCmd::Help => {
             let f = &settings.command_flag;
             push!(format!(
-                "`{f}state stat -char <char> [-c <category>] -n <name> -v <value>` · \
-                 `{f}state modify -char <char> -k <name> -v <value>` · \
-                 `{f}state modify -char <char> -k <name> -m <formula> [-t <turns>] [-name <mname>]` · \
-                 `{f}state list -char <char> [-c <category>]` · \
-                 `{f}state remove -char <char> -k <name>` | `-c <category>`"
+                "**stats**: `{f}state stat -char <c> [-c <cat>] -n <name> -v <value>` · \
+                 `{f}state modify -char <c> -k <name> -v <value>` · \
+                 `{f}state modify -char <c> -k <name> -m <formula> [-t <turns>] [-name <m>]` · \
+                 `{f}state list -char <c> [-c <cat>]` · \
+                 `{f}state remove -char <c> -k <name>` | `-c <cat>` · \
+                 `{f}state define -k <name> [-type ..] [-min ..] [-max ..] [-options a|b]`"
+            ));
+            push!(format!(
+                "**effects & checks**: `{f}state modifiers -char <c>` · \
+                 `{f}state trigger -char <c> -k <name> [-op le] -v <n> -msg <text>` · \
+                 `{f}state roll -char <c> [-k <stat>] [-d <die>] [-vs <n>]` · \
+                 `{f}state history -char <c> [-k <name>]`"
+            ));
+            push!(format!(
+                "**characters**: `{f}state clone -char <src> -to <dst>` · \
+                 `{f}state join -char <c>` / `{f}state leave -char <c>` · `{f}state roster`"
             ));
         }
         StateCmd::Stat { character, category, name, value } => {
@@ -1538,6 +1620,46 @@ async fn handle_command(
             }
             Err(e) => push!(format!("storage error: {e}")),
         },
+        StateCmd::Clone { from, to } => {
+            if from == to {
+                push!("source and destination are the same character.".to_string());
+                return out;
+            }
+            let src = store.list(&from, None).await.unwrap_or_default();
+            if src.is_empty() {
+                push!(format!("`{from}` has no stats to clone."));
+                return out;
+            }
+            let n = src.len();
+            for s in src {
+                // A clone is a silent copy — do not fire the destination's triggers.
+                let _ = write_stat(store, &to, &s.name, s.value.clone(), &actor, "clone", Some(&s.category)).await;
+            }
+            let _ = store.set_active(&to, true).await;
+            push!(format!("Cloned {n} stat(s) from `{from}` to `{to}`."));
+        }
+        StateCmd::Join { character } => match store.set_active(&character, true).await {
+            Ok(()) => push!(format!("`{character}` joined the adventure — its modifiers tick again.")),
+            Err(e) => push!(format!("storage error: {e}")),
+        },
+        StateCmd::Leave { character } => match store.set_active(&character, false).await {
+            Ok(()) => push!(format!("`{character}` left the adventure — frozen until it rejoins.")),
+            Err(e) => push!(format!("storage error: {e}")),
+        },
+        StateCmd::Roster => {
+            let chars = store.distinct_characters().await.unwrap_or_default();
+            let frozen: std::collections::HashSet<String> = store.inactive_characters().await.unwrap_or_default().into_iter().collect();
+            if chars.is_empty() {
+                push!("No characters yet.".to_string());
+            } else {
+                let body = chars
+                    .iter()
+                    .map(|c| if frozen.contains(c) { format!("`{c}` (frozen)") } else { format!("`{c}`") })
+                    .collect::<Vec<_>>()
+                    .join(", ");
+                push!(format!("Adventure roster: {body}"));
+            }
+        }
     }
     out
 }
@@ -1960,6 +2082,51 @@ mod tests {
         assert!(replies(&out)[0].contains("`hp`"), "{:?}", replies(&out));
         assert!(replies(&out)[0].contains("(alice)"), "actor recorded: {:?}", replies(&out));
         assert!(replies(&out)[0].contains("(modifier)"), "tick source recorded: {:?}", replies(&out));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn clone_and_adventure_membership() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-state-clone-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let set = test_settings();
+        let guild = "g1";
+
+        // a source character with two stats (one categorised)
+        say(&mut stores, &set, "!state stat -char alice -c vitals -n hp -v 50").await;
+        say(&mut stores, &set, "!state stat -char alice -n mana -v 30").await;
+
+        // clone alice -> bob: a faithful, non-destructive copy of the sheet
+        let out = say(&mut stores, &set, "!state clone -char alice -to bob").await;
+        assert!(replies(&out)[0].contains("Cloned 2 stat(s)"), "{:?}", replies(&out));
+        let bob_hp = stores.guild(guild).await.unwrap().stat_get("bob", "hp").await.unwrap().unwrap();
+        assert_eq!(bob_hp.value, Value::Int(50));
+        assert_eq!(bob_hp.category, "vitals");
+
+        // a modifier on each; both tick while active
+        say(&mut stores, &set, "!state modify -char alice -k hp -m 1 -t 99 -name a").await;
+        say(&mut stores, &set, "!state modify -char bob -k hp -m 1 -t 99 -name b").await;
+        say(&mut stores, &set, "tick").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "hp").await.unwrap().unwrap().value, Value::Int(51));
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("bob", "hp").await.unwrap().unwrap().value, Value::Int(51));
+
+        // bob leaves → frozen; alice keeps ticking
+        let out = say(&mut stores, &set, "!state leave -char bob").await;
+        assert!(replies(&out)[0].contains("frozen"), "{:?}", replies(&out));
+        say(&mut stores, &set, "tick").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("alice", "hp").await.unwrap().unwrap().value, Value::Int(52));
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("bob", "hp").await.unwrap().unwrap().value, Value::Int(51), "bob is frozen");
+
+        // roster marks bob frozen
+        let out = say(&mut stores, &set, "!state roster").await;
+        assert!(replies(&out)[0].contains("`bob` (frozen)"), "{:?}", replies(&out));
+        assert!(replies(&out)[0].contains("`alice`"), "{:?}", replies(&out));
+
+        // bob rejoins → ticks again
+        say(&mut stores, &set, "!state join -char bob").await;
+        say(&mut stores, &set, "tick").await;
+        assert_eq!(stores.guild(guild).await.unwrap().stat_get("bob", "hp").await.unwrap().unwrap().value, Value::Int(52));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
