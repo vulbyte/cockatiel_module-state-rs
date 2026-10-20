@@ -1317,17 +1317,28 @@ async fn send_container(write: &Arc<AsyncMutex<WsWriteHalf>>, c: ContainerForEng
     }
 }
 
-async fn register_catch_all(write: &Arc<AsyncMutex<WsWriteHalf>>, id: &Arc<AsyncMutex<EngineIdentity>>) {
+/// Register `!state` with the engine AND opt into unknown-command alerts. The
+/// alert opt-in also keeps us in the plain-message fanout (see the engine's
+/// `wants_plain_messages`), which the per-message turn tick relies on.
+async fn register_commands(write: &Arc<AsyncMutex<WsWriteHalf>>, id: &Arc<AsyncMutex<EngineIdentity>>, flag: &str) {
     let id = id.lock().await.clone();
     let c = ContainerForEngine {
         version: 2,
         auth_token: id.auth,
         module_name: id.module,
         module_instance_uuid7: id.instance,
-        payload: Some(EnginePayload::Commands(Commands { commands: vec![], alert_on_unknown_command: false })),
+        payload: Some(EnginePayload::Commands(Commands {
+            commands: vec![Command {
+                command_name: STATE_COMMAND.to_string(),
+                command_flag: flag.to_string(),
+                command_description: "per-character stats, modifiers, triggers, rolls".to_string(),
+                command_flags: vec![],
+            }],
+            alert_on_unknown_command: true,
+        })),
     };
     send_container(write, c).await;
-    info!("registered as a catch-all (parses !state itself)");
+    info!("registered !{STATE_COMMAND} (+ unknown-command alerts)");
 }
 
 fn reply_container(id: &EngineIdentity, chat: &ChatMessage, msg: String) -> ContainerForEngine {
@@ -1723,7 +1734,7 @@ async fn main() -> Result<(), Box<dyn std::error::Error>> {
         let mut read = read;
         let mut stores = Stores::new(settings.db_dir.clone());
         loop {
-            register_catch_all(&write_for_task, &identity_for_task).await;
+            register_commands(&write_for_task, &identity_for_task, &settings.command_flag).await;
             loop {
                 let Some(msg) = read.next().await else { break };
                 let data = match msg {
