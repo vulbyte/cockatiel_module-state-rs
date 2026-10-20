@@ -294,14 +294,16 @@ fn parse_delta(s: &str) -> Option<f64> {
     t.trim_start_matches('+').parse::<f64>().ok()
 }
 
-/// Parse a turn count: `7`, `x7`, or `inf`/`infinite`/`forever` → -1 (indefinite).
-/// A finite count must be >= 1.
+/// Parse a turn count: `7` / `x7` (finite), or anything non-positive —
+/// `0`, a negative number, `inf`/`infinite`/`forever` — means INDEFINITE (-1).
+/// (An unspecified count is handled by the caller as indefinite too.)
 fn parse_turns(s: &str) -> Option<i64> {
     let t = s.trim().trim_start_matches(['x', 'X']).trim();
     if t.eq_ignore_ascii_case("inf") || t.eq_ignore_ascii_case("infinite") || t.eq_ignore_ascii_case("forever") {
         return Some(-1);
     }
-    t.parse::<i64>().ok().filter(|n| *n > 0)
+    let n = t.parse::<i64>().ok()?;
+    Some(if n <= 0 { -1 } else { n })
 }
 
 /// Infer a value from raw text when no `type` is declared.
@@ -1537,6 +1539,14 @@ mod tests {
             parse_state_command("modifier health +5 inf"),
             Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: -1 }, false))
         );
+        // a negative or zero turn count also means indefinite
+        for t in ["-1", "x-1", "0", "x0"] {
+            assert_eq!(
+                parse_state_command(&format!("modifier health +5 {t}")),
+                Some((StateCmd::ModAdd { name: "health".into(), key: "health".into(), delta: 5.0, turns: -1 }, false)),
+                "turns `{t}` should be indefinite"
+            );
+        }
         assert_eq!(parse_state_command("modifier remove regen"), Some((StateCmd::ModRemove { name: "regen".into() }, false)));
         assert_eq!(parse_state_command("modifier list"), Some((StateCmd::ModList, false)));
         // a mention after the verb targets another user

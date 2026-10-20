@@ -22,8 +22,8 @@ attached to a chat user, with optional **constraints**.
 
 A modifier adjusts a stat by `delta` **every turn** (a turn = one ordinary
 message from the affected user; `!state` commands don't count). It lasts
-`x<turns>` turns, or **indefinitely** (`inf`, or omit the turns). A modifier has
-a **name** so it can be removed/replaced easily.
+`x<turns>` turns, or **indefinitely** — omit the turns, or use `inf`, a negative
+number, or `0`. A modifier has a **name** so it can be removed/replaced easily.
 
 ```
 !state modifier health +5 x7        # +5 health each turn, for 7 turns
