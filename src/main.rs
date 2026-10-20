@@ -712,6 +712,25 @@ fn parse_state_command(args: &str) -> Option<StateCmd> {
     }
 }
 
+/// The usage for a known `!state` subcommand, for an "incomplete command" hint.
+fn subcommand_usage(verb: &str) -> Option<&'static str> {
+    Some(match verb {
+        "stat" => "`stat -char <c> [-c <cat>] -n <name> -v <value>`",
+        "modify" | "mod" => "`modify -char <c> -k <name> -v <value>` (or `-m <formula>`)",
+        "list" => "`list -char <c> [-c <cat>]`",
+        "remove" | "delete" | "rm" => "`remove -char <c> -k <name>` (or `-c <cat>`)",
+        "define" => "`define -k <name> [-type ..] [-min ..] [-max ..] [-options a|b]`",
+        "modifiers" | "mods" => "`modifiers -char <c>`",
+        "trigger" => "`trigger -char <c> -k <name> [-op le] -v <n> -msg <text>`",
+        "roll" => "`roll -char <c> [-k <stat>] [-d <die>] [-vs <n>]`",
+        "history" | "log" => "`history -char <c> [-k <name>]`",
+        "clone" | "copy" => "`clone -char <src> -to <dst>`",
+        "join" => "`join -char <c>`",
+        "leave" => "`leave -char <c>`",
+        _ => return None,
+    })
+}
+
 fn split_head(s: &str) -> (&str, &str) {
     let s = s.trim_start();
     match s.split_once(char::is_whitespace) {
@@ -1689,7 +1708,17 @@ async fn handle_message(
     // A `!state` command does NOT advance a turn.
     if let Some(args) = parse_state_args(&chat.raw_message, &settings.command_flag, STATE_COMMAND) {
         let Some(cmd) = parse_state_command(&args) else {
-            return Vec::new();
+            // It IS a `!state` message but the arguments were wrong → say why +
+            // how to fix it, rather than staying silent.
+            let verb = args.split_whitespace().next().unwrap_or("");
+            let msg = if verb.is_empty() {
+                format!("`!{STATE_COMMAND}` needs a subcommand — try `!{STATE_COMMAND} help`.")
+            } else if let Some(usage) = subcommand_usage(&verb.to_ascii_lowercase()) {
+                format!("`!{STATE_COMMAND} {verb}` is incomplete — usage: {usage}")
+            } else {
+                format!("`{verb}` isn't a `!{STATE_COMMAND}` subcommand — try `!{STATE_COMMAND} help`.")
+            };
+            return vec![reply_container(id, chat, msg)];
         };
         return handle_command(id, chat, stores, settings, &guild_key, cmd).await;
     }
@@ -2138,6 +2167,28 @@ mod tests {
         say(&mut stores, &set, "!state join -char bob").await;
         say(&mut stores, &set, "tick").await;
         assert_eq!(stores.guild(guild).await.unwrap().stat_get("bob", "hp").await.unwrap().unwrap().value, Value::Int(52));
+
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// A `!state` message with wrong arguments gets a helpful, specific reply
+    /// (rather than silence): an unknown subcommand, an incomplete known one, or
+    /// a bare `!state`.
+    #[tokio::test]
+    async fn invalid_usage_gets_a_helpful_reply() {
+        let dir = std::env::temp_dir().join(format!("cockatiel-state-bad-{}", uuid::Uuid::now_v7()));
+        let mut stores = Stores::new(dir.to_string_lossy().to_string());
+        let set = test_settings();
+
+        let out = say(&mut stores, &set, "!state bogus").await;
+        assert!(replies(&out)[0].contains("isn't a `!state` subcommand"), "{:?}", replies(&out));
+
+        let out = say(&mut stores, &set, "!state stat -n hp").await; // missing -char
+        assert!(replies(&out)[0].contains("is incomplete"), "{:?}", replies(&out));
+        assert!(replies(&out)[0].contains("stat -char"), "shows usage: {:?}", replies(&out));
+
+        let out = say(&mut stores, &set, "!state").await;
+        assert!(replies(&out)[0].contains("needs a subcommand"), "{:?}", replies(&out));
 
         let _ = std::fs::remove_dir_all(&dir);
     }
